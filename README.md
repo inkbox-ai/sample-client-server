@@ -1,4 +1,4 @@
-# inkbox-openclaw-server
+# sample-client-server
 
 An example self-hosted webhook receiver for [Inkbox](https://inkbox.ai). Verifies signatures with the `inkbox` SDK, spools payloads to disk, and logs a domain-aware summary. Also ships a WebSocket server for Inkbox phone media streams (Inkbox-managed TTS + STT). Bring your own downstream intelligence.
 
