@@ -11,7 +11,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from .config import get_config
+from inkbox_webhook.config import get_config
 
 
 SYSTEM_TEXT: str = (

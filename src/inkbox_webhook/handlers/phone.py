@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..config import Config
+from inkbox_webhook.config import Config
 
 
 def _pick_first(*values: Any) -> str:

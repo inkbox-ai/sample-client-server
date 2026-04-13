@@ -8,9 +8,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..config import Config
-from .email import is_email_event, summarize_email_payload
-from .phone import build_phone_webhook_response, is_phone_event, summarize_phone_payload
+from inkbox_webhook.config import Config
+from inkbox_webhook.handlers.email import is_email_event, summarize_email_payload
+from inkbox_webhook.handlers.phone import (
+    build_phone_webhook_response,
+    is_phone_event,
+    summarize_phone_payload,
+)
 
 
 def summarize_webhook_payload(payload: dict[str, Any]) -> str:

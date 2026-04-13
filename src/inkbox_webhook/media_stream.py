@@ -26,7 +26,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from .config import Config, get_config
+from inkbox_webhook.config import Config, get_config
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +45,9 @@ def _wake_openclaw(cfg: Config, text: str) -> None:
     token = cfg.get("openclaw_hooks_token", "")
     if not token:
         return
-    port = cfg.get("openclaw_gateway_port", 18789)
+    port = cfg.get("openclaw_gateway_port", 18_789)
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/hooks/wake",
+        url=f"http://127.0.0.1:{port}/hooks/wake",
         data=json.dumps({"text": text, "mode": "now"}).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {token}",
@@ -141,7 +141,10 @@ async def _handle_ws(ws: ServerConnection, cfg: Config) -> None:
     if call.call_id:
         _wake_openclaw(
             cfg,
-            f"Inkbox call started. Call ID: {call.call_id}. Local: {call.local_phone_number}. Remote: {call.remote_phone_number}. Direction: {call.direction}.",
+            text=(
+                f"Inkbox call started. Call ID: {call.call_id}. Local: {call.local_phone_number}. "
+                f"Remote: {call.remote_phone_number}. Direction: {call.direction}."
+            ),
         )
     logger.info("Call WS connected call_id=%s remote=%s", call.call_id, call.remote_phone_number)
 

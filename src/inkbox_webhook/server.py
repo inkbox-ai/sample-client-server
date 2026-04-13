@@ -19,8 +19,11 @@ from typing import Any, cast
 
 from inkbox import verify_webhook
 
-from .config import Config, get_config
-from .handlers.dispatch import build_webhook_http_response, summarize_webhook_payload
+from inkbox_webhook.config import Config, get_config
+from inkbox_webhook.handlers.dispatch import (
+    build_webhook_http_response,
+    summarize_webhook_payload,
+)
 
 logger = logging.getLogger(__name__)
 
