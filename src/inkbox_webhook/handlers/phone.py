@@ -78,9 +78,6 @@ def summarize_phone_payload(payload: dict[str, Any]) -> str:
         parts.append(f"Local: {_truncate(local, 60)}.")
     if status:
         parts.append(f"Status: {status}.")
-    parts.append(
-        "Check the newest file in ~/openclaw-config/spool/ and handle phone events carefully. For incoming calls, use the configured TTS/STT call path and escalate to the user on Telegram if context is sensitive or ambiguous."
-    )
     return " ".join(parts)
 
 

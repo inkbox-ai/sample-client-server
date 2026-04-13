@@ -4,7 +4,9 @@ src/inkbox_webhook/server.py
 Inkbox webhook receiver.
 
 Listens for incoming webhooks, verifies signatures via ``inkbox.verify_webhook``,
-and writes parsed payloads to the spool directory for pickup.
+writes parsed payloads to the spool directory, and logs a domain-aware summary.
+Downstream processing is the user's responsibility — tail the spool dir from
+whatever agent/workflow you like.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, cast
@@ -29,28 +30,6 @@ logger = logging.getLogger(__name__)
 CONFIG: Config = cast(Config, {})
 
 
-def trigger_openclaw_wake(summary: str) -> None:
-    """Wake OpenClaw via the gateway's HTTP hooks endpoint."""
-    port = CONFIG.get("openclaw_gateway_port", 18789)
-    token = CONFIG.get("openclaw_hooks_token", "")
-    url = f"http://127.0.0.1:{port}/hooks/wake"
-    body = json.dumps({"text": summary, "mode": "now"}).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info(f"[{time.strftime('%H:%M:%S')}] OpenClaw wake -> {resp.status}")
-    except Exception as exc:
-        logger.info(f"[{time.strftime('%H:%M:%S')}] OpenClaw wake failed: {exc}")
-
-
 class WebhookHandler(BaseHTTPRequestHandler):
     """HTTP handler that authenticates, spools, and dispatches Inkbox webhooks."""
 
@@ -60,7 +39,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         return self.path == expected
 
     def do_POST(self) -> None:
-        """Handle a POSTed webhook: verify signature, spool, wake, and reply."""
+        """Handle a POSTed webhook: verify signature, spool, log a summary, and reply."""
         if not self._match_path("/webhook"):
             self.send_response(404)
             self.end_headers()
@@ -115,8 +94,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             )
 
         logger.info(f"[{time.strftime('%H:%M:%S')}] Spooled -> {spool_file.name}")
-        summary = summarize_webhook_payload(payload)
-        trigger_openclaw_wake(summary)
+        logger.info(summarize_webhook_payload(payload))
 
         response_body = build_webhook_http_response(payload, CONFIG)
         if response_body is not None:

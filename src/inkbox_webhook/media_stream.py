@@ -7,7 +7,6 @@ This server handles live call WebSocket sessions. It is intentionally simple:
 - Declares Inkbox-managed STT + TTS via handshake response headers.
 - Receives transcript events from Inkbox.
 - Sends textStream responses for final transcript chunks.
-- Optionally wakes OpenClaw with call context for observability/escalation.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ import asyncio
 import json
 import logging
 import re
-import urllib.request
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any
@@ -26,7 +24,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from inkbox_webhook.config import Config, get_config
+from inkbox_webhook.config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -38,28 +36,6 @@ def _safe_json(s: str) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
-
-
-def _wake_openclaw(cfg: Config, text: str) -> None:
-    """Fire a best-effort ``/hooks/wake`` POST to the local OpenClaw gateway."""
-    token = cfg.get("openclaw_hooks_token", "")
-    if not token:
-        return
-    port = cfg.get("openclaw_gateway_port", 18_789)
-    req = urllib.request.Request(
-        url=f"http://127.0.0.1:{port}/hooks/wake",
-        data=json.dumps({"text": text, "mode": "now"}).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            logger.info("OpenClaw wake for call event -> %s", resp.status)
-    except Exception as exc:
-        logger.warning("OpenClaw wake for call event failed: %s", exc)
 
 
 @dataclass
@@ -135,17 +111,9 @@ def _parse_call_context(headers: Headers) -> CallSession:
     )
 
 
-async def _handle_ws(ws: ServerConnection, cfg: Config) -> None:
+async def _handle_ws(ws: ServerConnection) -> None:
     """Handle a single call WebSocket: parse context, loop over events, and respond."""
     call = _parse_call_context(ws.request.headers)
-    if call.call_id:
-        _wake_openclaw(
-            cfg,
-            text=(
-                f"Inkbox call started. Call ID: {call.call_id}. Local: {call.local_phone_number}. "
-                f"Remote: {call.remote_phone_number}. Direction: {call.direction}."
-            ),
-        )
     logger.info("Call WS connected call_id=%s remote=%s", call.call_id, call.remote_phone_number)
 
     try:
@@ -214,11 +182,8 @@ async def _run() -> None:
 
     logger.info("Inkbox media WS listening on %s:%s%s", host, port, path)
 
-    async def handler(ws: ServerConnection):
-        await _handle_ws(ws, cfg)
-
     async with serve(
-        handler,
+        _handle_ws,
         host,
         port,
         process_request=_process_request,

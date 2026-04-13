@@ -6,13 +6,15 @@ version = "0.1.0"
 description = "Inkbox email webhook receiver"
 requires-python = ">=3.12"
 dependencies = [
+  "fastapi>=0.115,<0.120",
   "inkbox==0.2.10",
+  "python-dotenv>=1,<2",
+  "uvicorn[standard]>=0.30,<0.40",
   "websockets>=12,<16",
 ]
 
 [project.scripts]
 inkbox-webhook = "inkbox_webhook.server:main"
-inkbox-webhook-process = "inkbox_webhook.processor:main"
 inkbox-phone-media = "inkbox_webhook.media_stream:main"
 
 [build-system]

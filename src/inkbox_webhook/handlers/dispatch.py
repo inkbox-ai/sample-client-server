@@ -23,7 +23,7 @@ def summarize_webhook_payload(payload: dict[str, Any]) -> str:
         return summarize_email_payload(payload)
     if is_phone_event(payload):
         return summarize_phone_payload(payload)
-    return "Inkbox webhook received. Check the newest file in ~/openclaw-config/spool/."
+    return "Inkbox webhook received (unknown event type)."
 
 
 def build_webhook_http_response(
