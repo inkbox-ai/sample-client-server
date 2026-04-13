@@ -78,6 +78,6 @@ def summarize_email_payload(payload: dict[str, Any]) -> str:
     if snippet:
         parts.append(f"Snippet: {_truncate(snippet, 220)}.")
     parts.append(
-        "Check the newest file in ~/openclaw-config/spool/ and handle it using this policy: if the sender is Alex, reply directly. If the sender is someone else and the right response is obvious and low-risk, reply directly. If it is ambiguous, sensitive, or high-stakes, message Alex on Telegram instead of replying by email."
+        "Check the newest file in ~/openclaw-config/spool/ and handle it using this policy: if the sender is the user, reply directly. If the sender is someone else and the right response is obvious and low-risk, reply directly. If it is ambiguous, sensitive, or high-stakes, message the user on Telegram instead of replying by email."
     )
     return " ".join(parts)
