@@ -1,4 +1,6 @@
-"""Deterministic wake trigger for pending Inkbox spool files."""
+"""Deterministic wake trigger for pending Inkbox spool files.
+src/inkbox_webhook/processor.py
+"""
 
 from __future__ import annotations
 
@@ -10,15 +12,16 @@ from pathlib import Path
 from .config import get_config
 
 
-SYSTEM_TEXT = (
+SYSTEM_TEXT: str = (
     "Inkbox email queue pending. Process all pending files in "
     "~/openclaw-config/spool/*.json. For each inbound message.received event, "
-    "read the spool file, use judgment, reply directly to Alex, reply directly to others when the response is obvious and low-risk, and escalate ambiguous or high-stakes cases to Alex on Telegram. "
+    "read the spool file, use judgment, reply directly to the user, reply directly to others when the response is relatively obvious. "
     "After handling a file, move it to ~/openclaw-config/spool/processed/. If handling fails, move it to ~/openclaw-config/spool/failed/ and leave a sibling .error.txt note."
 )
 
 
-def _gateway_env() -> dict:
+def _gateway_env() -> dict[str, str]:
+    """Return a subprocess env with the OpenClaw gateway token injected from ``openclaw.json``."""
     env = os.environ.copy()
     cfg_path = Path.home() / ".openclaw" / "openclaw.json"
     if cfg_path.exists():
@@ -30,6 +33,7 @@ def _gateway_env() -> dict:
 
 
 def process_once() -> int:
+    """Fire one ``openclaw system event`` wake for the current spool and return the pending count."""
     cfg = get_config()
     spool_dir = Path(cfg["spool_dir"])
     pending = sorted(p for p in spool_dir.glob("*.json") if p.is_file())
@@ -46,7 +50,7 @@ def process_once() -> int:
         SYSTEM_TEXT,
     ]
     result = subprocess.run(
-        cmd,
+        args=cmd,
         capture_output=True,
         text=True,
         timeout=30,
@@ -60,6 +64,7 @@ def process_once() -> int:
 
 
 def main() -> None:
+    """CLI entrypoint that runs one ``process_once`` pass and prints the count."""
     count = process_once()
     print(f"Queued wake for {count} spool files")
 

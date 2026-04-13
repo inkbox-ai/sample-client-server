@@ -1,13 +1,35 @@
-"""Configuration loader -- reads .env from project root."""
+"""Configuration loader -- reads .env from project root.
+src/inkbox_webhook/config.py
+"""
 
 import os
 from pathlib import Path
+from typing import TypedDict
+
+
+class Config(TypedDict):
+    """Typed application configuration returned by ``get_config``."""
+
+    signing_key: str
+    api_key: str
+    listen_port: int
+    path_prefix: str
+    spool_dir: Path
+    processed_dir: Path
+    failed_dir: Path
+    openclaw_gateway_port: int
+    openclaw_hooks_token: str
+    phone_auto_answer: bool
+    phone_client_websocket_url: str
+    phone_media_host: str
+    phone_media_port: int
+
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 SPOOL_DIR = PROJECT_ROOT / "spool"
 
 
-def load_env():
+def load_env() -> None:
     """Load .env file into environment (no external deps)."""
     env_file = PROJECT_ROOT / ".env"
     if not env_file.exists():
@@ -23,7 +45,8 @@ def load_env():
             os.environ.setdefault(key.strip(), value.strip())
 
 
-def get_config() -> dict:
+def get_config() -> Config:
+    """Return the typed application configuration, loading ``.env`` first."""
     load_env()
     signing_key = os.environ.get("INKBOX_SIGNING_KEY", "")
     if not signing_key:

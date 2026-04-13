@@ -1,7 +1,14 @@
-"""Email-specific webhook helpers."""
+"""Email-specific webhook helpers.
+src/inkbox_webhook/handlers/email.py
+"""
+
+from __future__ import annotations
+
+from typing import Any
 
 
-def _pick_first(*values):
+def _pick_first(*values: Any) -> str:
+    """Return the first non-empty stripped string from ``values``, or ``""``."""
     for value in values:
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -9,20 +16,22 @@ def _pick_first(*values):
 
 
 def _truncate(text: str, limit: int = 160) -> str:
+    """Collapse whitespace in ``text`` and truncate with an ellipsis at ``limit`` chars."""
     text = " ".join(str(text).split())
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
 
 
-def is_email_event(payload: dict) -> bool:
+def is_email_event(payload: dict[str, Any]) -> bool:
+    """Return True if ``payload`` looks like an Inkbox ``message.*`` email event."""
     if not isinstance(payload, dict):
         return False
     event = _pick_first(payload.get("event"), payload.get("type"), payload.get("event_type"))
     return event.startswith("message.")
 
 
-def summarize_email_payload(payload: dict) -> str:
+def summarize_email_payload(payload: dict[str, Any]) -> str:
     """Build a compact summary for Inkbox email-related webhook payloads."""
     if not isinstance(payload, dict):
         return "Inkbox email webhook received. Check the latest spool file."

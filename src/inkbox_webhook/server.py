@@ -1,4 +1,5 @@
 """Inkbox webhook receiver.
+src/inkbox_webhook/server.py
 
 Listens for incoming webhooks, validates signatures per the Inkbox spec,
 and writes parsed payloads to the spool directory for pickup.
@@ -11,6 +12,8 @@ Signature scheme (https://inkbox.ai/docs/api/mail/webhooks):
   Timestamp tolerance: 300 seconds
 """
 
+from __future__ import annotations
+
 import hashlib
 import hmac
 import json
@@ -19,13 +22,14 @@ import time
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from typing import Any, cast
 
-from .config import get_config
-from .handlers import build_webhook_http_response, summarize_webhook_payload
+from .config import Config, get_config
+from .handlers.dispatch import build_webhook_http_response, summarize_webhook_payload
 
 logger = logging.getLogger(__name__)
 
-CONFIG: dict = {}
+CONFIG: Config = cast(Config, {})
 
 MAX_TIMESTAMP_DRIFT = 300  # seconds
 
@@ -53,7 +57,11 @@ def trigger_openclaw_wake(summary: str) -> None:
 
 
 def verify_signature(
-    body: bytes, request_id: str, timestamp: str, signature: str, key: str
+    body: bytes,
+    request_id: str,
+    timestamp: str,
+    signature: str,
+    key: str,
 ) -> bool:
     """Verify Inkbox webhook signature.
 
@@ -71,16 +79,24 @@ def verify_signature(
     received_digest = signature[len("sha256="):]
 
     message = f"{request_id}.{timestamp}.".encode() + body
-    expected_digest = hmac.new(key.encode(), message, hashlib.sha256).hexdigest()
+    expected_digest = hmac.new(
+        key=key.encode(),
+        msg=message,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
     return hmac.compare_digest(expected_digest, received_digest)
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
+    """HTTP handler that authenticates, spools, and dispatches Inkbox webhooks."""
+
     def _match_path(self, suffix: str) -> bool:
+        """Return True if the request path equals ``path_prefix + suffix``."""
         expected = CONFIG["path_prefix"] + suffix
         return self.path == expected
 
-    def do_POST(self):
+    def do_POST(self) -> None:
+        """Handle a POSTed webhook: verify signature, spool, wake, and reply."""
         if not self._match_path("/webhook"):
             self.send_response(404)
             self.end_headers()
@@ -108,6 +124,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"Invalid signature")
                 return
 
+        payload: dict[str, Any]
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
@@ -115,7 +132,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         spool_dir: Path = CONFIG["spool_dir"]
         spool_dir.mkdir(exist_ok=True)
-        ts_ms = int(time.time() * 1000)
+        ts_ms = int(time.time() * 1_000)
         spool_file = spool_dir / f"{ts_ms}.json"
         with open(spool_file, "w") as f:
             json.dump(
@@ -150,7 +167,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
-    def do_GET(self):
+    def do_GET(self) -> None:
+        """Handle a GET, returning 200 only on the ``/health`` path."""
         if self._match_path("/health"):
             self.send_response(200)
             self.end_headers()
@@ -159,11 +177,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: Any) -> None:
+        """Redirect ``BaseHTTPRequestHandler`` access logs to our logger."""
         logger.info(f"[{time.strftime('%H:%M:%S')}] {format % args}")
 
 
-def main():
+def main() -> None:
+    """CLI entrypoint that loads config and serves the webhook receiver forever."""
     global CONFIG
     CONFIG = get_config()
     port = CONFIG["listen_port"]

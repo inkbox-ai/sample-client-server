@@ -1,9 +1,16 @@
-"""Phone-specific webhook helpers."""
+"""Phone-specific webhook helpers.
+src/inkbox_webhook/handlers/phone.py
+"""
 
 from __future__ import annotations
 
+from typing import Any
 
-def _pick_first(*values):
+from ..config import Config
+
+
+def _pick_first(*values: Any) -> str:
+    """Return the first non-empty stripped string from ``values``, or ``""``."""
     for value in values:
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -11,13 +18,15 @@ def _pick_first(*values):
 
 
 def _truncate(text: str, limit: int = 180) -> str:
+    """Collapse whitespace in ``text`` and truncate with an ellipsis at ``limit`` chars."""
     text = " ".join(str(text).split())
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
 
 
-def _event_type(payload: dict) -> str:
+def _event_type(payload: dict[str, Any]) -> str:
+    """Return the event-name field from ``payload``, checking common aliases."""
     return _pick_first(
         payload.get("event"),
         payload.get("type"),
@@ -25,14 +34,15 @@ def _event_type(payload: dict) -> str:
     )
 
 
-def is_phone_event(payload: dict) -> bool:
+def is_phone_event(payload: dict[str, Any]) -> bool:
+    """Return True if ``payload`` is an incoming call/text or a ``call.*`` event."""
     if not isinstance(payload, dict):
         return False
     event = _event_type(payload)
     return event in {"incoming_call", "incoming_text"} or event.startswith("call.")
 
 
-def summarize_phone_payload(payload: dict) -> str:
+def summarize_phone_payload(payload: dict[str, Any]) -> str:
     """Build a compact summary for Inkbox phone-related webhook payloads."""
     if not isinstance(payload, dict):
         return "Inkbox phone webhook received. Check the latest spool file."
@@ -72,7 +82,9 @@ def summarize_phone_payload(payload: dict) -> str:
     return " ".join(parts)
 
 
-def build_phone_webhook_response(payload: dict, config: dict) -> dict | None:
+def build_phone_webhook_response(
+    payload: dict[str, Any], config: Config
+) -> dict[str, Any] | None:
     """Return an HTTP JSON response body for phone webhooks when required.
 
     Inkbox phone webhooks (incoming_call) expect an action response.
@@ -88,7 +100,7 @@ def build_phone_webhook_response(payload: dict, config: dict) -> dict | None:
     if not auto_answer:
         return {"action": "reject"}
 
-    response = {"action": "answer"}
+    response: dict[str, Any] = {"action": "answer"}
     ws_url = config.get("phone_client_websocket_url") or ""
     if isinstance(ws_url, str) and ws_url.strip():
         response["client_websocket_url"] = ws_url.strip()

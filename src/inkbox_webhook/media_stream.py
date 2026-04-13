@@ -1,4 +1,5 @@
 """Inkbox phone media stream WebSocket server.
+src/inkbox_webhook/media_stream.py
 
 This server handles live call WebSocket sessions. It is intentionally simple:
 - Declares Inkbox-managed STT + TTS via handshake response headers.
@@ -16,18 +17,20 @@ import re
 import urllib.request
 from dataclasses import dataclass
 from http import HTTPStatus
+from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from .config import get_config
+from .config import Config, get_config
 
 logger = logging.getLogger(__name__)
 
 
-def _safe_json(s: str) -> dict:
+def _safe_json(s: str) -> dict[str, Any]:
+    """Parse ``s`` as JSON, returning an empty dict on failure or non-object results."""
     try:
         data = json.loads(s)
         return data if isinstance(data, dict) else {}
@@ -35,7 +38,8 @@ def _safe_json(s: str) -> dict:
         return {}
 
 
-def _wake_openclaw(cfg: dict, text: str) -> None:
+def _wake_openclaw(cfg: Config, text: str) -> None:
+    """Fire a best-effort ``/hooks/wake`` POST to the local OpenClaw gateway."""
     token = cfg.get("openclaw_hooks_token", "")
     if not token:
         return
@@ -58,6 +62,8 @@ def _wake_openclaw(cfg: dict, text: str) -> None:
 
 @dataclass
 class CallSession:
+    """Per-connection state extracted from the handshake and call lifecycle events."""
+
     call_id: str = ""
     local_phone_number: str = ""
     remote_phone_number: str = ""
@@ -65,7 +71,8 @@ class CallSession:
     call_control_id: str = ""
 
 
-def _extract_event_name(payload: dict) -> str:
+def _extract_event_name(payload: dict[str, Any]) -> str:
+    """Return the event-name field from ``payload``, checking common aliases."""
     for key in ("event", "type", "event_type"):
         value = payload.get(key)
         if isinstance(value, str) and value:
@@ -73,8 +80,9 @@ def _extract_event_name(payload: dict) -> str:
     return ""
 
 
-def _extract_transcript_text(payload: dict) -> tuple[str, bool]:
-    candidates = [payload]
+def _extract_transcript_text(payload: dict[str, Any]) -> tuple[str, bool]:
+    """Return ``(text, is_final)`` from a transcript event payload."""
+    candidates: list[dict[str, Any]] = [payload]
     data = payload.get("data")
     if isinstance(data, dict):
         candidates.append(data)
@@ -97,6 +105,7 @@ def _extract_transcript_text(payload: dict) -> tuple[str, bool]:
 
 
 def _build_reply_text(user_text: str) -> str:
+    """Return a canned conversational reply for a final transcript chunk."""
     if not user_text:
         return "I’m here — can you repeat that?"
     normalized = user_text.lower()
@@ -113,6 +122,7 @@ def _build_reply_text(user_text: str) -> str:
 
 
 def _parse_call_context(headers: Headers) -> CallSession:
+    """Build a ``CallSession`` from the ``X-Call-Context`` handshake header."""
     raw = headers.get("X-Call-Context", "")
     ctx = _safe_json(raw)
     return CallSession(
@@ -123,7 +133,8 @@ def _parse_call_context(headers: Headers) -> CallSession:
     )
 
 
-async def _handle_ws(ws: ServerConnection, cfg: dict) -> None:
+async def _handle_ws(ws: ServerConnection, cfg: Config) -> None:
+    """Handle a single call WebSocket: parse context, loop over events, and respond."""
     call = _parse_call_context(ws.request.headers)
     if call.call_id:
         _wake_openclaw(
@@ -169,7 +180,8 @@ async def _handle_ws(ws: ServerConnection, cfg: dict) -> None:
         logger.info("Call WS closed call_id=%s", call.call_id)
 
 
-def _process_request(conn: ServerConnection, request: Request):
+def _process_request(conn: ServerConnection, request: Request) -> Response | None:
+    """Reject WS handshakes whose path does not match the configured media endpoint."""
     cfg = get_config()
     prefix = cfg.get("path_prefix", "")
     expected = f"{prefix}/phone/media/ws" if prefix else "/phone/media/ws"
@@ -178,13 +190,17 @@ def _process_request(conn: ServerConnection, request: Request):
     return None
 
 
-def _process_response(conn: ServerConnection, request: Request, response: Response):
+def _process_response(
+    conn: ServerConnection, request: Request, response: Response
+) -> Response:
+    """Inject Inkbox-managed STT/TTS opt-in headers onto the handshake response."""
     response.headers["X-Use-Inkbox-Text-To-Speech"] = "true"
     response.headers["X-Use-Inkbox-Speech-To-Text"] = "true"
     return response
 
 
 async def _run() -> None:
+    """Bind and serve the media-stream WebSocket until cancelled."""
     cfg = get_config()
     host = cfg.get("phone_media_host", "0.0.0.0")
     port = int(cfg.get("phone_media_port", 8090))
@@ -210,6 +226,7 @@ async def _run() -> None:
 
 
 def main() -> None:
+    """CLI entrypoint that configures logging and runs the media-stream server."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     asyncio.run(_run())
 
