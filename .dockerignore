@@ -8,7 +8,7 @@ __pycache__
 *.pyo
 .env
 .env.*
-spool
+payloads
 Dockerfile
 .dockerignore
 README.md

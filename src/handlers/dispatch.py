@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from config import Config
 from handlers.email import is_email_event, summarize_email_payload
 from handlers.phone import (
     build_phone_webhook_response,
@@ -26,11 +25,9 @@ def summarize_webhook_payload(payload: dict[str, Any]) -> str:
     return "Inkbox webhook received (unknown event type)."
 
 
-def build_webhook_http_response(
-    payload: dict[str, Any], config: Config
-) -> dict[str, Any] | None:
+def build_webhook_http_response(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Return an optional JSON response body required by some webhook domains."""
-    phone_response = build_phone_webhook_response(payload, config)
+    phone_response = build_phone_webhook_response(payload)
     if phone_response is not None:
         return phone_response
     return None

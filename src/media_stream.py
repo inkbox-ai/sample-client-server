@@ -24,7 +24,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from config import get_config
+from env_config import EnvConfig
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +155,8 @@ async def _handle_ws(ws: ServerConnection) -> None:
 
 def _process_request(conn: ServerConnection, request: Request) -> Response | None:
     """Reject WS handshakes whose path does not match the configured media endpoint."""
-    cfg = get_config()
-    prefix = cfg.get("path_prefix", "")
-    expected = f"{prefix}/phone/media/ws" if prefix else "/phone/media/ws"
+    prefix = f"/{EnvConfig.PATH_PREFIX}" if EnvConfig.PATH_PREFIX else ""
+    expected = f"{prefix}/phone/media/ws"
     if request.path != expected:
         return conn.respond(HTTPStatus.NOT_FOUND, "Not Found")
     return None
@@ -174,11 +173,10 @@ def _process_response(
 
 async def _run() -> None:
     """Bind and serve the media-stream WebSocket until cancelled."""
-    cfg = get_config()
-    host = cfg.get("phone_media_host", "0.0.0.0")
-    port = int(cfg.get("phone_media_port", 8090))
-    prefix = cfg.get("path_prefix", "")
-    path = f"{prefix}/phone/media/ws" if prefix else "/phone/media/ws"
+    host = EnvConfig.INKBOX_PHONE_MEDIA_HOST
+    port = EnvConfig.INKBOX_PHONE_MEDIA_PORT
+    prefix = f"/{EnvConfig.PATH_PREFIX}" if EnvConfig.PATH_PREFIX else ""
+    path = f"{prefix}/phone/media/ws"
 
     logger.info("Inkbox media WS listening on %s:%s%s", host, port, path)
 

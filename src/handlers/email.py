@@ -36,7 +36,7 @@ def is_email_event(payload: dict[str, Any]) -> bool:
 def summarize_email_payload(payload: dict[str, Any]) -> str:
     """Build a compact summary for Inkbox email-related webhook payloads."""
     if not isinstance(payload, dict):
-        return "Inkbox email webhook received. Check the latest spool file."
+        return "Inkbox email webhook received. Check the latest payload file."
 
     event = _pick_first(
         payload.get("event"),

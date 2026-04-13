@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from config import Config
+from env_config import EnvConfig
 
 
 def _pick_first(*values: Any) -> str:
@@ -47,7 +47,7 @@ def is_phone_event(payload: dict[str, Any]) -> bool:
 def summarize_phone_payload(payload: dict[str, Any]) -> str:
     """Build a compact summary for Inkbox phone-related webhook payloads."""
     if not isinstance(payload, dict):
-        return "Inkbox phone webhook received. Check the latest spool file."
+        return "Inkbox phone webhook received. Check the latest payload file."
 
     event = _event_type(payload) or "unknown"
 
@@ -81,9 +81,7 @@ def summarize_phone_payload(payload: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def build_phone_webhook_response(
-    payload: dict[str, Any], config: Config
-) -> dict[str, Any] | None:
+def build_phone_webhook_response(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Return an HTTP JSON response body for phone webhooks when required.
 
     Inkbox phone webhooks (incoming_call) expect an action response.
@@ -95,12 +93,11 @@ def build_phone_webhook_response(
     if event != "incoming_call":
         return None
 
-    auto_answer = bool(config.get("phone_auto_answer", True))
-    if not auto_answer:
+    if not EnvConfig.INKBOX_PHONE_AUTO_ANSWER:
         return {"action": "reject"}
 
     response: dict[str, Any] = {"action": "answer"}
-    ws_url = config.get("phone_client_websocket_url") or ""
-    if isinstance(ws_url, str) and ws_url.strip():
+    ws_url = EnvConfig.INKBOX_PHONE_CLIENT_WEBSOCKET_URL
+    if ws_url and ws_url.strip():
         response["client_websocket_url"] = ws_url.strip()
     return response
