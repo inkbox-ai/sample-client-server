@@ -23,6 +23,9 @@ class EnvConfig():
     # (the default). Can be left unset in dev if you disable verification.
     INKBOX_SIGNING_KEY: str | None = os.getenv("INKBOX_SIGNING_KEY")
 
+    # OpenAI key used by the live sample phone agent.
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "").strip()
+
     # When true (default), the /webhook HTTP endpoint and the
     # /phone/media/ws WebSocket handshake both reject requests that
     # lack a valid X-Inkbox-Signature. Set to "false" for local testing
@@ -36,18 +39,12 @@ class EnvConfig():
 
     LISTEN_PORT: int = int(os.getenv("LISTEN_PORT", "8080"))
 
+    # ngrok auto-tunnel + Inkbox auto-patching
 
-    # Phone webhook behavior
+    # Required. A pyngrok tunnel is opened on LISTEN_PORT at startup and
+    # every phone number + mailbox in the org is PATCHed to point at it.
+    NGROK_AUTHTOKEN: str = os.getenv("NGROK_AUTHTOKEN", "").strip()
 
-    # If true, incoming_call webhooks respond with {"action": "answer"} (default true)
-    INKBOX_PHONE_AUTO_ANSWER: bool = os.getenv(
-        "INKBOX_PHONE_AUTO_ANSWER", "true",
-    ).strip().lower() in {"1", "true", "yes", "on"}
-
-    # WebSocket URL Inkbox should connect to for live call media.
-    # Handed back in the /webhook incoming-call response body so Inkbox
-    # knows where to open the media session. Leave unset to let Inkbox
-    # fall back to the phone number's default client_websocket_url.
-    INKBOX_PHONE_CLIENT_WEBSOCKET_URL: str = os.getenv(
-        "INKBOX_PHONE_CLIENT_WEBSOCKET_URL", "",
-    )
+    # Inkbox API key used by the bootstrap step to list + update phone
+    # numbers and mailboxes. Required.
+    INKBOX_API_KEY: str = os.getenv("INKBOX_API_KEY", "").strip()

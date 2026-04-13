@@ -7,11 +7,66 @@ An example self-hosted server for [Inkbox](https://inkbox.ai). A single FastAPI 
 
 See `src/data_models/webhooks.py` and `src/data_models/phone_media.py` for the exact JSON shapes exchanged on each side — the app uses those same Pydantic models to validate incoming requests, so "what hits my endpoint" lives in one place.
 
-## Configuration
+## What you'll be able to do by the end
 
-Copy `.env.example` to `.env` and fill in your values — at minimum `INKBOX_SIGNING_KEY`. When running in Docker you can skip the `.env` file and pass the same variables via `-e` flags; `env_config.py` reads from `os.environ` and treats `.env` as optional.
+Once the steps below are done, your local server will be able to:
 
-Signature verification is **on by default**. If you're testing locally without a real signing key, set `INKBOX_REQUIRE_SIGNATURE=false`.
+- **Receive emails** — inbound messages (and status notifications like delivered / bounced) land on `POST /webhook` and get persisted to `payloads/`.
+- **Receive SMS and MMS** — inbound text messages (with attachments) hit the same `/webhook` endpoint.
+- **Accept phone calls** — incoming calls are auto-answered and connected to a sample AI agent (`src/phone_agent.py`) that talks to the caller live over the phone-media WebSocket, using Inkbox-managed speech-to-text and text-to-speech.
+
+## Prerequisites — set up your Inkbox org
+
+Before running the server, provision an agent identity in the Inkbox console and collect four credentials. Steps:
+
+### 1. Create the agent identity (with mailbox + phone number)
+
+1. Go to [console.inkbox.ai](https://console.inkbox.ai) and sign in.
+2. Open **Identities** → **New identity**. Pick a name for your agent (e.g. `demo-agent`).
+3. During creation (or from the identity's detail page afterward), attach:
+   - A **mailbox** — pick an email address on one of the available domains.
+   - A **phone number** — provision a number in your region.
+4. Save. The identity now owns one mailbox and one phone number; this server's bootstrap will patch both on startup.
+
+### 2. Grab the Inkbox API key for the agent identity
+
+On the identity's detail page, open **API keys** → **Create key**. Copy the key value (you won't see it again). This is your `INKBOX_API_KEY` — the bootstrap uses it to `list` + `update` the identity's phone numbers and mailboxes.
+
+### 3. Grab the Inkbox webhook signing key
+
+Go to [console.inkbox.ai/webhooks](https://inkbox.ai/console/webhooks) → **Create signing key**. Copy the `whsec_...` value. This is your `INKBOX_SIGNING_KEY` — used by this server to verify `X-Inkbox-Signature` on every inbound webhook and on the phone-media WebSocket handshake.
+
+### 4. Grab an ngrok authtoken
+
+Create a free account at [dashboard.ngrok.com](https://dashboard.ngrok.com), then open [dashboard.ngrok.com/get-started/your-authtoken](https://dashboard.ngrok.com/get-started/your-authtoken) and copy the token. This is your `NGROK_AUTHTOKEN` — the bootstrap uses it to open a public HTTPS tunnel to this local server so Inkbox can reach your webhooks.
+
+### 5. Grab an OpenAI API key
+
+Create a key at [platform.openai.com/api-keys](https://platform.openai.com/api-keys). This is your `OPENAI_API_KEY` — the sample phone agent (`src/phone_agent.py`) uses it to generate live call replies.
+
+### 6. Back in this repo: fill in `.env`
+
+```sh
+cp .env.example .env
+chmod 600 .env
+```
+
+Open `.env` and paste in the four values you just collected:
+
+```
+INKBOX_API_KEY=...        # step 2
+INKBOX_SIGNING_KEY=whsec_...  # step 3
+NGROK_AUTHTOKEN=...       # step 4
+OPENAI_API_KEY=sk-...     # step 5
+```
+
+That's it — you're ready to run. On startup the server will open the ngrok tunnel, PATCH every phone number + mailbox on your identity to point at the tunnel, and start serving webhooks + the phone-media WebSocket.
+
+## Configuration notes
+
+Signature verification is **on by default**. If you're testing locally without a real signing key, set `INKBOX_REQUIRE_SIGNATURE=false` — but then Inkbox won't be able to call you (the real platform always signs), so this is only useful for curl-based local testing.
+
+When running in Docker you can skip the `.env` file and pass the same variables via `-e` flags; `env_config.py` reads from `os.environ` and treats `.env` as optional.
 
 ## Run with Docker (recommended)
 

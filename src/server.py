@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from typing import Any
 
@@ -42,7 +41,6 @@ from data_models.phone_media import (
     CallContext,
     StartEvent,
     StopEvent,
-    TextEvent,
     TranscriptEvent,
 )
 from data_models.webhooks import (
@@ -52,6 +50,8 @@ from data_models.webhooks import (
     PhoneIncomingTextWebhookPayload,
 )
 from env_config import EnvConfig
+from ngrok_bootstrap import setup_ngrok_and_patch_inkbox
+from phone_agent import PhoneAgent
 
 logger = logging.getLogger(__name__)
 
@@ -182,10 +182,9 @@ def build_webhook_http_response(payload: ParsedWebhook) -> IncomingCallActionRes
     """
     if not isinstance(payload, PhoneIncomingCallWebhookPayload):
         return None
-    if not EnvConfig.INKBOX_PHONE_AUTO_ANSWER:
-        return IncomingCallActionResponse(action="reject")
-    ws_url = (EnvConfig.INKBOX_PHONE_CLIENT_WEBSOCKET_URL or "").strip() or None
-    return IncomingCallActionResponse(action="answer", client_websocket_url=ws_url)
+    # client_websocket_url is stored on the phone number itself (patched at
+    # boot by ngrok_bootstrap), so we don't need to override it here.
+    return IncomingCallActionResponse(action="answer")
 
 
 # ---------------------------------------------------------------------------
@@ -318,27 +317,6 @@ def _verify_ws_handshake_signature(headers: dict[str, str]) -> bool:
     )
 
 
-def _build_reply_text(user_text: str) -> str:
-    """Return a canned conversational reply for a final transcript chunk."""
-    if not user_text:
-        return "I’m here — can you repeat that?"
-    normalized = user_text.lower()
-    if any(g in normalized for g in ("hello", "hi", "hey")):
-        return "Hey — I hear you. What do you need?"
-    if "bye" in normalized or "goodbye" in normalized:
-        return "Got it. Talk soon — goodbye."
-    compact = re.sub(r"\s+", " ", user_text).strip()
-    if len(compact) > 220:
-        compact = compact[:217] + "..."
-    return f"Got it. You said: {compact}"
-
-
-async def _send_text_reply(websocket: WebSocket, text: str) -> None:
-    """Send a single-shot text reply as ``delta`` + ``done`` frames."""
-    await websocket.send_text(TextEvent(delta=text).model_dump_json(exclude_none=True))
-    await websocket.send_text(TextEvent(done=True).model_dump_json(exclude_none=True))
-
-
 @app.websocket("/phone/media/ws")
 async def phone_media_ws(websocket: WebSocket) -> None:
     """
@@ -367,6 +345,8 @@ async def phone_media_ws(websocket: WebSocket) -> None:
         call.call_id, call.phone_number, call.direction,
     )
 
+    agent = PhoneAgent(api_key=EnvConfig.OPENAI_API_KEY)
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -383,6 +363,7 @@ async def phone_media_ws(websocket: WebSocket) -> None:
                     StartEvent.model_validate(data)
                 except ValidationError:
                     pass
+                await agent.greet(websocket)
                 continue
             if event == "stop":
                 try:
@@ -393,12 +374,18 @@ async def phone_media_ws(websocket: WebSocket) -> None:
                     )
                 except ValidationError:
                     logger.info("Call WS stop call_id=%s", call.call_id)
+                await agent.cancel_active_response("stream_stopped")
                 break
             if event == "barge_in":
                 try:
-                    BargeInEvent.model_validate(data)
+                    parsed_barge_in = BargeInEvent.model_validate(data)
+                    logger.info(
+                        "Call WS barge_in call_id=%s trigger=%s interrupted=%s",
+                        call.call_id, parsed_barge_in.trigger, parsed_barge_in.tts_interrupted,
+                    )
                 except ValidationError:
                     pass
+                await agent.cancel_active_response("caller_barge_in")
                 continue
             if event == "transcript":
                 try:
@@ -407,13 +394,14 @@ async def phone_media_ws(websocket: WebSocket) -> None:
                     continue
                 if not transcript.is_final:
                     continue
-                reply = _build_reply_text(transcript.text)
-                await _send_text_reply(websocket, reply)
+                logger.info("Call WS final transcript call_id=%s text=%s", call.call_id, transcript.text[:160])
+                await agent.handle_final_transcript(websocket, transcript.text)
                 continue
             # ignore unknown / unmodelled events (e.g. media) — extend here
     except WebSocketDisconnect:
         logger.info("Call WS closed call_id=%s", call.call_id)
     finally:
+        await agent.close()
         if websocket.client_state != WebSocketState.DISCONNECTED:
             try:
                 await websocket.close()
@@ -438,12 +426,15 @@ def main() -> None:
             "(the default). Set the key in .env or export INKBOX_REQUIRE_SIGNATURE=false "
             "for local testing.",
         )
+    if not EnvConfig.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is required for the sample phone agent.")
     logger.info(
         "Inkbox sample client/server listening on :%d (verify signatures: %s)",
         EnvConfig.LISTEN_PORT,
         EnvConfig.INKBOX_REQUIRE_SIGNATURE,
     )
     logger.info("Payloads directory: %s", PAYLOADS_DIR)
+    setup_ngrok_and_patch_inkbox()
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
