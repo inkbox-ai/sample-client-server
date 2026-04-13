@@ -1,5 +1,5 @@
 """
-src/inkbox_webhook/handlers/phone.py
+src/handlers/phone.py
 
 Phone-specific webhook helpers.
 """
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from inkbox_webhook.config import Config
+from config import Config
 
 
 def _pick_first(*values: Any) -> str:

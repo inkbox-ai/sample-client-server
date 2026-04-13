@@ -1,5 +1,5 @@
 """
-src/inkbox_webhook/server.py
+src/server.py
 
 Inkbox webhook receiver.
 
@@ -19,11 +19,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from inkbox import verify_webhook
-from inkbox_webhook.config import Config, get_config
-from inkbox_webhook.handlers.dispatch import (
-    build_webhook_http_response,
-    summarize_webhook_payload,
-)
+
+from config import Config, get_config
+from handlers.dispatch import build_webhook_http_response, summarize_webhook_payload
 
 logger = logging.getLogger(__name__)
 

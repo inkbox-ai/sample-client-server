@@ -1,5 +1,5 @@
 """
-src/inkbox_webhook/config.py
+src/config.py
 
 Configuration loader -- reads .env from project root.
 """
@@ -24,7 +24,7 @@ class Config(TypedDict):
     phone_media_port: int
 
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent
 SPOOL_DIR = PROJECT_ROOT / "spool"
 
 

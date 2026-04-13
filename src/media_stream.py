@@ -1,5 +1,5 @@
 """
-src/inkbox_webhook/media_stream.py
+src/media_stream.py
 
 Inkbox phone media stream WebSocket server.
 
@@ -24,7 +24,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from inkbox_webhook.config import get_config
+from config import get_config
 
 logger = logging.getLogger(__name__)
 

@@ -1,5 +1,5 @@
 """
-src/inkbox_webhook/handlers/dispatch.py
+src/handlers/dispatch.py
 
 Webhook payload dispatch across handler domains.
 """
@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from inkbox_webhook.config import Config
-from inkbox_webhook.handlers.email import is_email_event, summarize_email_payload
-from inkbox_webhook.handlers.phone import (
+from config import Config
+from handlers.email import is_email_event, summarize_email_payload
+from handlers.phone import (
     build_phone_webhook_response,
     is_phone_event,
     summarize_phone_payload,

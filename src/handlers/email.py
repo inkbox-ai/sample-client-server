@@ -1,5 +1,5 @@
 """
-src/inkbox_webhook/handlers/email.py
+src/handlers/email.py
 
 Email-specific webhook helpers.
 """
