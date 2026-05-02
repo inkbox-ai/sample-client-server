@@ -45,7 +45,8 @@ import h2.exceptions
 import h2.settings
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 from cryptography.x509.oid import NameOID
 from inkbox import Inkbox
 
@@ -98,16 +99,41 @@ def _save_state(state_dir: Path, state: dict[str, Any]) -> None:
         pass
 
 
-def _load_or_create_keypair(state_dir: Path) -> rsa.RSAPrivateKey:
+def _print_secret_once(secret: str, path: Path) -> None:
+    """One-time disclosure of the connect secret on stderr.
+
+    Goes to ``sys.stderr`` directly — never the logger — so it isn't
+    indexed by structured log shippers (CloudWatch / Datadog / Loki /
+    etc). The secret is also persisted under ``path`` (chmod 600).
+    """
+    import sys
+    banner = (
+        "\n"
+        "=================================================================\n"
+        "  Inkbox tunnel: ONE-TIME connect_secret disclosure\n"
+        "  This will not appear on subsequent runs.\n"
+        f"  Secret persisted at: {path} (chmod 600)\n"
+        "  Optionally copy into .env as INKBOX_TUNNEL_SECRET.\n"
+        "=================================================================\n"
+        f"  connect_secret = {secret}\n"
+        "=================================================================\n"
+    )
+    print(banner, file=sys.stderr, flush=True)
+
+
+def _load_or_create_keypair(state_dir: Path) -> PrivateKeyTypes:
     key_path = state_dir / _KEY_FILE
     if key_path.is_file():
         return serialization.load_pem_private_key(
             key_path.read_bytes(), password=None,
-        )  # type: ignore[return-value]
+        )
 
-    logger.info("[bootstrap] generating RSA-2048 keypair -> %s", key_path)
+    # Default to EC P-256: 30-50× faster keygen than RSA-2048, smaller
+    # handshakes, and accepted by Let's Encrypt. Both EC and RSA load
+    # back through the same load_pem_private_key path.
+    logger.info("[bootstrap] generating EC P-256 keypair -> %s", key_path)
     state_dir.mkdir(parents=True, exist_ok=True)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = ec.generate_private_key(ec.SECP256R1())
     pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -121,7 +147,7 @@ def _load_or_create_keypair(state_dir: Path) -> rsa.RSAPrivateKey:
     return key
 
 
-def _build_csr(key: rsa.RSAPrivateKey, public_host: str) -> str:
+def _build_csr(key: PrivateKeyTypes, public_host: str) -> str:
     csr = (
         x509.CertificateSigningRequestBuilder()
         .subject_name(
@@ -152,7 +178,7 @@ def _maybe_resign_cert(
     api: TunnelsAPI,
     tunnel_id: UUID,
     state_dir: Path,
-    key: rsa.RSAPrivateKey,
+    key: PrivateKeyTypes,
     public_host: str,
 ) -> bytes:
     """Return the cert chain PEM; sign a fresh CSR if the cached cert is stale."""
@@ -279,11 +305,30 @@ def bootstrap_tunnel() -> TunnelBundle:
                 tunnel_obj.get("status"), tunnel_id,
             )
             if secret:
-                logger.info(
-                    "[bootstrap]   >>> COPY THIS SECRET INTO .env AS "
-                    "INKBOX_TUNNEL_SECRET <<<",
+                # Persist immediately so a crash anywhere in cert /
+                # CSR flow below doesn't strand us with no on-disk
+                # record of the connect secret. Cert paths get added
+                # by a later _save_state call.
+                _save_state(
+                    state_dir,
+                    {
+                        "tunnel_id": str(tunnel_id),
+                        "name": name,
+                        "secret": secret,
+                        "mode": mode.value,
+                        "zone": zone,
+                    },
                 )
-                logger.info("[bootstrap]   secret=%s", secret)
+                # Print the secret directly to stderr — bypassing the
+                # logger keeps it out of CloudWatch / Datadog / Loki
+                # ingestion pipelines. Logged-INFO breadcrumb says
+                # where it lives instead.
+                _print_secret_once(secret, state_dir / _STATE_FILE)
+                logger.info(
+                    "[bootstrap]   connect_secret saved to %s (chmod 600). "
+                    "It will not be printed again on subsequent runs.",
+                    state_dir / _STATE_FILE,
+                )
 
         if existing is None:
             existing = api.get(tunnel_id)
@@ -413,24 +458,37 @@ class TLSTerminator:
 
     def __init__(self, *, cert_chain_pem: bytes, key_pem: bytes):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        # ssl.SSLContext.load_cert_chain wants paths; write the chain+key
-        # to NamedTemporaryFile, load, delete. The PEM bytes never linger
-        # on disk after init returns.
+        # ssl.SSLContext.load_cert_chain only takes paths, so the PEMs
+        # round-trip through tempfiles. To avoid relying on platform
+        # default umasks, create with O_CREAT|O_EXCL|O_WRONLY mode 0600
+        # and unlink in finally even on exception.
         import tempfile
-        with tempfile.NamedTemporaryFile(
-            suffix=".pem", delete=False,
-        ) as cert_f, tempfile.NamedTemporaryFile(
-            suffix=".pem", delete=False,
-        ) as key_f:
-            cert_f.write(cert_chain_pem)
-            key_f.write(key_pem)
-            cert_path = cert_f.name
-            key_path = key_f.name
+        cert_path = key_path = None
         try:
+            cert_fd, cert_path = tempfile.mkstemp(suffix=".pem")
+            try:
+                os.fchmod(cert_fd, 0o600)
+            except (AttributeError, OSError):
+                pass
+            with os.fdopen(cert_fd, "wb") as f:
+                f.write(cert_chain_pem)
+
+            key_fd, key_path = tempfile.mkstemp(suffix=".pem")
+            try:
+                os.fchmod(key_fd, 0o600)
+            except (AttributeError, OSError):
+                pass
+            with os.fdopen(key_fd, "wb") as f:
+                f.write(key_pem)
+
             ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
         finally:
-            os.unlink(cert_path)
-            os.unlink(key_path)
+            for p in (cert_path, key_path):
+                if p is not None:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
         self._ctx = ctx
 
     def session(self) -> "TLSSession":
@@ -505,6 +563,10 @@ class TLSSession:
 _PING_INTERVAL = 20.0
 _BACKOFF_CAP = 30.0
 _BACKOFF_JITTER = 0.25  # ±25% jitter on each backoff sleep
+
+
+class _TunnelAuthError(RuntimeError):
+    """Permanent auth failure; do not retry the connection."""
 _HOP_BY_HOP_REQUEST = frozenset({
     "host", "connection", "upgrade", "keep-alive", "te", "trailer",
     "transfer-encoding", "proxy-authenticate", "proxy-authorization",
@@ -586,16 +648,36 @@ class InkboxTunnelClient:
                 pass
 
     async def serve_forever(self) -> None:
-        """Maintain the connection with jittered exponential-backoff reconnects."""
+        """Maintain the connection with jittered exponential-backoff reconnects.
+
+        Auth failures from ``/_system/hello`` propagate out — there's
+        no point hot-looping a permanently-bad secret. Other failures
+        (network blips, GOAWAY, h2 protocol errors) reconnect.
+        """
         backoff = 1.0
+        consecutive_failures = 0
         while not self._stop.is_set():
             try:
                 await self._run_once()
                 backoff = 1.0
+                consecutive_failures = 0
             except asyncio.CancelledError:
                 raise
+            except _TunnelAuthError:
+                logger.error(
+                    "[tunnel-client] /_system/hello rejected the connect "
+                    "secret — refusing to retry. Rotate the secret via "
+                    "POST /api/v1/tunnels/{id}/rotate-secret, update "
+                    "INKBOX_TUNNEL_SECRET (or wipe the state file), and "
+                    "restart.",
+                )
+                raise
             except Exception:
-                logger.exception("[tunnel-client] connection error; reconnecting")
+                consecutive_failures += 1
+                logger.exception(
+                    "[tunnel-client] connection error (#%d); reconnecting",
+                    consecutive_failures,
+                )
             if self._stop.is_set():
                 return
             jitter = backoff * _BACKOFF_JITTER * (2 * random.random() - 1)
@@ -705,8 +787,14 @@ class InkboxTunnelClient:
 
         status = await self._await_response_status(stream_id)
         self._streams.pop(stream_id, None)
+        if status in (401, 403):
+            raise _TunnelAuthError(
+                f"/_system/hello returned {status}; connect secret is invalid",
+            )
         if status != 200:
-            raise RuntimeError(f"/_system/hello returned {status}; check tunnel secret")
+            raise RuntimeError(
+                f"/_system/hello returned {status}; transient — will retry",
+            )
         logger.info(
             "[tunnel-client] /_system/hello 200; opening %d parked intake streams",
             self._pool_size,
@@ -747,19 +835,26 @@ class InkboxTunnelClient:
     # --- intake pool --------------------------------------------------------
 
     async def _intake_loop(self, slot: int) -> None:
-        """Maintain one parked intake slot indefinitely (until disconnect)."""
-        while not self._stop.is_set():
+        """
+        Maintain one parked intake slot indefinitely. Transient errors
+        (h2 protocol blips, single-stream resets, parse failures) get a
+        short backoff and a retry — the slot only exits on real teardown
+        (``_stop`` set, or h2 connection gone).
+        """
+        while not self._stop.is_set() and self._h2 is not None:
             try:
                 envelope = await self._park_one_intake(slot)
             except asyncio.CancelledError:
-                return
-            except (h2.exceptions.ProtocolError, ConnectionError):
-                return
+                raise
             except Exception:
-                logger.exception("[tunnel-client] intake slot %d error", slot)
-                return
+                logger.exception(
+                    "[tunnel-client] intake slot %d transient error; retrying",
+                    slot,
+                )
+                await asyncio.sleep(0.25)
+                continue
             if envelope is None:
-                continue  # stream RST'd or empty; reopen
+                continue  # stream RST'd or empty; reopen immediately
             self._spawn(self._dispatch(envelope))
 
     async def _park_one_intake(self, slot: int) -> _Envelope | None:
@@ -902,59 +997,72 @@ class InkboxTunnelClient:
     # --- HTTP envelope dispatch (edge + passthrough) ------------------------
 
     async def _dispatch_http(self, envelope: _Envelope) -> None:
-        if self._terminator is None:
-            # Edge mode: envelope body is already plaintext request body.
+        disconnect_event = asyncio.Event()
+        if self._stop.is_set():
+            disconnect_event.set()
+        try:
+            if self._terminator is None:
+                # Edge mode: envelope body is already plaintext request body.
+                status, resp_headers, resp_body = await _invoke_asgi_http(
+                    app=self._app,
+                    method=envelope.method,
+                    path=envelope.path,
+                    headers=envelope.forwarded_headers,
+                    body=envelope.body,
+                    disconnect_event=disconnect_event,
+                )
+                await self._post_response(
+                    envelope.request_id,
+                    status=status,
+                    headers=_filter_response_headers(resp_headers),
+                    body=resp_body,
+                )
+                return
+
+            # Passthrough mode: envelope.body is encrypted bytes from
+            # the third-party TCP stream (TLS records). Drive the BIO
+            # until a full HTTP/1.1 request is parseable, dispatch,
+            # encrypt response.
+            session = self._terminator.session()
+            plaintext_chunks, _ = session.feed(envelope.body)
+            plaintext = bytearray(b"".join(plaintext_chunks))
+            try:
+                method, path, req_headers, body = _parse_complete_http_request(
+                    plaintext,
+                )
+            except _NeedMoreData:
+                await self._post_response(
+                    envelope.request_id,
+                    status=400,
+                    headers=[("content-type", "text/plain")],
+                    body=b"passthrough: incomplete HTTP/1.1 request",
+                )
+                return
+
             status, resp_headers, resp_body = await _invoke_asgi_http(
                 app=self._app,
-                method=envelope.method,
-                path=envelope.path,
-                headers=envelope.forwarded_headers,
-                body=envelope.body,
+                method=method,
+                path=path,
+                headers=req_headers,
+                body=body,
+                disconnect_event=disconnect_event,
             )
+            wire_response = _build_http_response(
+                status, _filter_response_headers(resp_headers), resp_body,
+            )
+            encrypted = session.send(wire_response)
+            encrypted += session.close()
             await self._post_response(
                 envelope.request_id,
-                status=status,
-                headers=_filter_response_headers(resp_headers),
-                body=resp_body,
+                status=200,
+                headers=[("content-type", "application/octet-stream")],
+                body=bytes(encrypted),
+                opaque=True,
             )
-            return
-
-        # Passthrough mode: envelope.body is encrypted bytes from the
-        # third-party TCP stream (TLS records). Drive the BIO until we
-        # have a complete HTTP/1.1 request, dispatch, encrypt response.
-        session = self._terminator.session()
-        plaintext_chunks, _ = session.feed(envelope.body)
-        plaintext = bytearray(b"".join(plaintext_chunks))
-        try:
-            method, path, req_headers, body = _parse_complete_http_request(plaintext)
-        except _NeedMoreData:
-            await self._post_response(
-                envelope.request_id,
-                status=400,
-                headers=[("content-type", "text/plain")],
-                body=b"passthrough: incomplete HTTP/1.1 request",
-            )
-            return
-
-        status, resp_headers, resp_body = await _invoke_asgi_http(
-            app=self._app,
-            method=method,
-            path=path,
-            headers=req_headers,
-            body=body,
-        )
-        wire_response = _build_http_response(
-            status, _filter_response_headers(resp_headers), resp_body,
-        )
-        encrypted = session.send(wire_response)
-        encrypted += session.close()
-        await self._post_response(
-            envelope.request_id,
-            status=200,
-            headers=[("content-type", "application/octet-stream")],
-            body=bytes(encrypted),
-            opaque=True,
-        )
+        finally:
+            # Unblock any handler still parked in receive() so the task
+            # can finish cleanly instead of leaking forever.
+            disconnect_event.set()
 
     # --- WebSocket bridge ---------------------------------------------------
 
@@ -1107,9 +1215,18 @@ class InkboxTunnelClient:
                 elif event.kind in ("end", "reset"):
                     recv_done = True
         finally:
-            sender.cancel()
+            # Clean shutdown: signal the outbound queue with a sentinel
+            # so app_to_wire exits its loop on its own. Only fall back
+            # to cancel if it's still running after a short grace.
+            ws_session.signal_outbound_eof()
             try:
-                await sender
+                await asyncio.wait_for(sender, timeout=2.0)
+            except asyncio.TimeoutError:
+                sender.cancel()
+                try:
+                    await sender
+                except (asyncio.CancelledError, Exception):
+                    pass
             except (asyncio.CancelledError, Exception):
                 pass
 
@@ -1143,8 +1260,16 @@ class InkboxTunnelClient:
         ]
         if opaque:
             req_headers.append(("inkbox-route-kind", "tcp-passthrough"))
+        # Drop any inbound content-length / transfer-encoding before
+        # forwarding under inkbox-h-* — the outer content-length set on
+        # this stream is the source of truth for the wire body length.
+        # Forwarding both would land two `content-length` headers on
+        # the third party, which HTTP/1.1 says to reject.
         for k, v in headers:
-            req_headers.append((f"inkbox-h-{k.lower()}", v))
+            kl = k.lower()
+            if kl in ("content-length", "transfer-encoding"):
+                continue
+            req_headers.append((f"inkbox-h-{kl}", v))
 
         async with self._send_lock:
             stream_id = self._open_stream_locked(
@@ -1201,12 +1326,19 @@ class InkboxTunnelClient:
                     await self._flush()
 
     def _mark_window_blocked(self, stream_id: int) -> None:
-        ev = self._window_events.get(stream_id)
-        if ev is None:
-            ev = asyncio.Event()
-            self._window_events[stream_id] = ev
-        ev.clear()
-        self._conn_window_event.clear()
+        """
+        Mark whichever window is empty (stream, conn, or both). Callers
+        pass ``stream_id`` for the stream side; the conn side is decided
+        by inspecting h2 state directly so we never spuriously clear the
+        conn event when only the stream is exhausted.
+        """
+        ev = self._window_events.setdefault(stream_id, asyncio.Event())
+        if self._h2 is not None and self._h2.local_flow_control_window(
+            stream_id,
+        ) <= 0:
+            ev.clear()
+        if self._h2 is not None and self._h2.outbound_flow_control_window <= 0:
+            self._conn_window_event.clear()
 
     async def _await_window(self, stream_id: int) -> None:
         async with self._send_lock:
@@ -1216,17 +1348,31 @@ class InkboxTunnelClient:
             conn_window = self._h2.outbound_flow_control_window
             if stream_window > 0 and conn_window > 0:
                 return
-        # One of the windows is closed; await whichever event will fire.
-        events: list[asyncio.Event] = []
+        # One of the windows is closed; await whichever events will fire.
+        # Track every wait-task we create so we can cancel the loser(s)
+        # — asyncio.wait(FIRST_COMPLETED) does not cancel them for us.
+        wait_tasks: list[asyncio.Task[Any]] = []
         if stream_window <= 0:
             ev = self._window_events.setdefault(stream_id, asyncio.Event())
-            events.append(ev)
+            wait_tasks.append(asyncio.create_task(ev.wait()))
         if conn_window <= 0:
-            events.append(self._conn_window_event)
-        await asyncio.wait(
-            [asyncio.create_task(e.wait()) for e in events],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+            wait_tasks.append(asyncio.create_task(self._conn_window_event.wait()))
+        if not wait_tasks:
+            return
+        try:
+            done, pending = await asyncio.wait(
+                wait_tasks, return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in wait_tasks:
+                if not t.done():
+                    t.cancel()
+            for t in wait_tasks:
+                if not t.done():
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1282,6 +1428,7 @@ async def _invoke_asgi_http(
     path: str,
     headers: list[tuple[str, str]],
     body: bytes,
+    disconnect_event: asyncio.Event | None = None,
 ) -> tuple[int, list[tuple[str, str]], bytes]:
     raw_path, _, query_string = path.partition("?")
     asgi_headers = []
@@ -1305,12 +1452,19 @@ async def _invoke_asgi_http(
     }
 
     body_sent = False
+    disc = disconnect_event if disconnect_event is not None else asyncio.Event()
 
     async def receive() -> dict[str, Any]:
         nonlocal body_sent
         if not body_sent:
             body_sent = True
             return {"type": "http.request", "body": body, "more_body": False}
+        # Subsequent calls must block until the dispatch is genuinely
+        # cancelled (stream RST, connection drop, etc.) rather than
+        # returning http.disconnect immediately — ASGI handlers that
+        # poll receive() for backpressure / disconnect (SSE, streaming
+        # responses) would otherwise terminate the moment they checked.
+        await disc.wait()
         return {"type": "http.disconnect"}
 
     response_status = 500
@@ -1513,6 +1667,18 @@ class _WSASGISession:
             yield msg
             if msg["type"] == "websocket.close":
                 return
+
+    def signal_outbound_eof(self) -> None:
+        """Push the sentinel that ends ``outbound()`` cleanly.
+
+        Used by the pump on shutdown so the sender task can exit on
+        its own (no cancel required), and idempotent — extra sentinels
+        on an already-closed queue are harmless.
+        """
+        try:
+            self._outbound.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
 
     async def deliver(self, wire: dict[str, Any]) -> None:
         kind = wire.get("type")
