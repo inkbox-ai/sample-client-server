@@ -28,6 +28,21 @@ class EnvConfig():
     # OpenAI key used by the live sample phone agent.
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "").strip()
 
+    # When true, bypass Inkbox-managed STT/TTS and bridge the live phone
+    # WebSocket directly to OpenAI's Realtime API (g711_ulaw both ways).
+    # Used to isolate tunnel transport from STT/TTS plumbing during
+    # end-to-end testing.
+    USE_OPENAI_REALTIME: bool = os.getenv(
+        "USE_OPENAI_REALTIME", "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    # Realtime model identifier. The GA model name is "gpt-realtime"; older
+    # previews used "gpt-4o-realtime-preview". Override via env if you need
+    # a specific snapshot.
+    OPENAI_REALTIME_MODEL: str = os.getenv(
+        "OPENAI_REALTIME_MODEL", "gpt-realtime",
+    ).strip()
+
     # When true (default), the /webhook HTTP endpoint and the
     # /phone/media/ws WebSocket handshake both reject requests that
     # lack a valid X-Inkbox-Signature. Set to "false" for local testing

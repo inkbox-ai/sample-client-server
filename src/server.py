@@ -26,7 +26,7 @@ import asyncio
 import json
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import uvicorn
@@ -58,6 +58,16 @@ from inkbox_tunnel_bootstrap import (
     patch_inkbox_objects_to_tunnel,
 )
 from phone_agent import PhoneAgent
+from realtime_phone_agent import run_realtime_bridge
+
+
+# Handshake response headers used when ``USE_OPENAI_REALTIME=true``: opt
+# out of Inkbox-managed STT/TTS so the platform sends raw caller audio
+# as ``media`` events and forwards our ``media`` events to the caller.
+REALTIME_HANDSHAKE_RESPONSE_HEADERS: dict[str, str] = {
+    "X-Use-Inkbox-Text-To-Speech": "false",
+    "X-Use-Inkbox-Speech-To-Text": "false",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -363,16 +373,38 @@ async def phone_media_ws(websocket: WebSocket) -> None:
         return
 
     call = _parse_call_context(headers)
+    use_realtime = EnvConfig.USE_OPENAI_REALTIME
+    accept_headers = (
+        REALTIME_HANDSHAKE_RESPONSE_HEADERS if use_realtime else HANDSHAKE_RESPONSE_HEADERS
+    )
     await websocket.accept(
         headers=[
             (k.lower().encode(), v.encode())
-            for k, v in HANDSHAKE_RESPONSE_HEADERS.items()
+            for k, v in accept_headers.items()
         ],
     )
     logger.info(
-        "Call WS connected call_id=%s local=%s direction=%s",
+        "Call WS connected call_id=%s local=%s direction=%s mode=%s",
         call.call_id, call.phone_number, call.direction,
+        "openai-realtime" if use_realtime else "inkbox-tts-stt",
     )
+
+    if use_realtime:
+        try:
+            await run_realtime_bridge(
+                websocket=websocket,
+                api_key=EnvConfig.OPENAI_API_KEY,
+                model=EnvConfig.OPENAI_REALTIME_MODEL,
+                call_id=call.call_id,
+            )
+        except WebSocketDisconnect:
+            pass
+        finally:
+            logger.info("Call WS closed call_id=%s", call.call_id)
+            if websocket.client_state != WebSocketState.DISCONNECTED:
+                with suppress(RuntimeError):
+                    await websocket.close()
+        return
 
     agent = PhoneAgent(api_key=EnvConfig.OPENAI_API_KEY)
 
@@ -482,8 +514,12 @@ def main() -> None:
         tls_terminator=bundle.tls_terminator,
     )
 
+    # Pass the FastAPI instance directly. Using the import string
+    # ("server:app") would have uvicorn re-import the module fresh,
+    # producing a *different* `app` whose `.state.tunnel_client` is
+    # unset — and the lifespan would silently no-op the tunnel client.
     uvicorn.run(
-        "server:app",
+        app,
         host="0.0.0.0",
         port=EnvConfig.LISTEN_PORT,
         log_level="info",

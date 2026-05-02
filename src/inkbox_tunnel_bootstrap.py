@@ -409,8 +409,18 @@ def patch_inkbox_objects_to_tunnel(public_host: str) -> None:
     PATCH every phone number and mailbox in the org to point at the
     tunnel's public host. Same SDK calls as the old ngrok bootstrap;
     only the host changes.
+
+    The SDK takes a base URL *without* the ``/api/v1`` suffix and
+    appends it itself. Our ``INKBOX_API_BASE`` env var includes the
+    suffix (it's the canonical control-plane URL), so strip it before
+    handing it to the SDK to keep prod/dev parity.
     """
-    client = Inkbox(api_key=EnvConfig.INKBOX_API_KEY)
+    sdk_base = EnvConfig.INKBOX_API_BASE
+    for suffix in ("/api/v1/", "/api/v1"):
+        if sdk_base.endswith(suffix):
+            sdk_base = sdk_base[: -len(suffix)]
+            break
+    client = Inkbox(api_key=EnvConfig.INKBOX_API_KEY, base_url=sdk_base)
 
     webhook_url = f"https://{public_host}/webhook"
     ws_url = f"wss://{public_host}/phone/media/ws"
@@ -617,6 +627,15 @@ class InkboxTunnelClient:
     ):
         self._tunnel_id = str(tunnel_id)
         self._secret = secret
+        # Per-connection owner token issued by /_system/hello. Required
+        # on every /_system/intake stream as `x-owner-token` for the
+        # server's fenced-eviction check. Reset on each reconnect.
+        self._owner_token: str | None = None
+        # Server-honored config returned in the hello response — fall
+        # back to None / pool_size if the field is absent.
+        self._server_pool_size: int | None = None
+        self._intake_idle_seconds: float | None = None
+        self._response_deadline_seconds: float | None = None
         self._zone = zone
         self._pool_size = pool_size
         self._app = local_app
@@ -689,21 +708,35 @@ class InkboxTunnelClient:
 
     async def _run_once(self) -> None:
         await self._open_connection()
+        # The read loop must be running before _send_hello — hello waits
+        # for a response that's delivered through the read loop's frame
+        # dispatcher. Start it as a task first, then send hello and wait.
+        read_task = asyncio.create_task(self._read_loop())
+        ping_task: asyncio.Task[None] | None = None
         try:
-            await self._send_hello()
-            for slot in range(self._pool_size):
-                self._spawn(self._intake_loop(slot))
-
-            ping_task = asyncio.create_task(self._ping_loop())
             try:
-                await self._read_loop()
-            finally:
+                await self._send_hello()
+            except Exception:
+                read_task.cancel()
+                raise
+            effective_pool = self._server_pool_size or self._pool_size
+            for slot in range(effective_pool):
+                self._spawn(self._intake_loop(slot))
+            ping_task = asyncio.create_task(self._ping_loop())
+            await read_task
+        finally:
+            if ping_task is not None:
                 ping_task.cancel()
                 try:
                     await ping_task
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
                     pass
-        finally:
+            if not read_task.done():
+                read_task.cancel()
+                try:
+                    await read_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             for task in list(self._tasks):
                 task.cancel()
             for task in list(self._tasks):
@@ -770,6 +803,12 @@ class InkboxTunnelClient:
     # --- handshake -----------------------------------------------------------
 
     async def _send_hello(self) -> None:
+        # Reset per-connection state.
+        self._owner_token = None
+        self._server_pool_size = None
+        self._intake_idle_seconds = None
+        self._response_deadline_seconds = None
+
         async with self._send_lock:
             stream_id = self._open_stream_locked(
                 [
@@ -785,7 +824,7 @@ class InkboxTunnelClient:
                 end_stream=True,
             )
 
-        status = await self._await_response_status(stream_id)
+        status, body = await self._await_response(stream_id)
         self._streams.pop(stream_id, None)
         if status in (401, 403):
             raise _TunnelAuthError(
@@ -795,9 +834,41 @@ class InkboxTunnelClient:
             raise RuntimeError(
                 f"/_system/hello returned {status}; transient — will retry",
             )
+
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"/_system/hello returned 200 but body was not JSON: {exc}",
+            ) from exc
+        owner_token = payload.get("owner_token")
+        if not owner_token:
+            raise RuntimeError(
+                "/_system/hello response missing owner_token; cannot park "
+                "intake streams without it",
+            )
+        self._owner_token = str(owner_token)
+        # Honor server-provided sizing if present.
+        if isinstance(payload.get("default_pool_size"), int):
+            self._server_pool_size = int(payload["default_pool_size"])
+        if (val := payload.get("intake_idle_seconds")) is not None:
+            try:
+                self._intake_idle_seconds = float(val)
+            except (TypeError, ValueError):
+                pass
+        if (val := payload.get("response_deadline_seconds")) is not None:
+            try:
+                self._response_deadline_seconds = float(val)
+            except (TypeError, ValueError):
+                pass
+
+        effective_pool = self._server_pool_size or self._pool_size
         logger.info(
-            "[tunnel-client] /_system/hello 200; opening %d parked intake streams",
-            self._pool_size,
+            "[tunnel-client] /_system/hello 200; opening %d parked intake "
+            "streams (owner_token=%s..%s)",
+            effective_pool,
+            self._owner_token[:6],
+            self._owner_token[-4:],
         )
 
     def _open_stream_locked(
@@ -813,24 +884,32 @@ class InkboxTunnelClient:
         return stream_id
 
     async def _await_response_status(self, stream_id: int) -> int:
+        status, _ = await self._await_response(stream_id)
+        return status
+
+    async def _await_response(
+        self, stream_id: int,
+    ) -> tuple[int, bytes]:
+        """Wait for the full response on ``stream_id``; return ``(status, body)``."""
         queue = self._streams[stream_id]
+        status: int = 0
+        body = bytearray()
+        got_headers = False
         while True:
             event = await queue.get()
-            if event.kind == "headers":
+            if event.kind == "headers" and not got_headers:
+                got_headers = True
                 status_str = next(
                     (v for k, v in event.headers if k == ":status"), "0",
                 )
-                # Drain remaining frames so the queue can be GC'd.
-                while True:
-                    try:
-                        evt = queue.get_nowait()
-                        if evt.kind in ("end", "reset"):
-                            break
-                    except asyncio.QueueEmpty:
-                        break
-                return int(status_str)
-            if event.kind in ("end", "reset"):
-                return 0
+                try:
+                    status = int(status_str)
+                except ValueError:
+                    status = 0
+            elif event.kind == "data":
+                body.extend(event.data)
+            elif event.kind in ("end", "reset"):
+                return status, bytes(body)
 
     # --- intake pool --------------------------------------------------------
 
@@ -855,9 +934,16 @@ class InkboxTunnelClient:
                 continue
             if envelope is None:
                 continue  # stream RST'd or empty; reopen immediately
+            logger.info(
+                "[tunnel-client] envelope arrived slot=%d kind=%s method=%s path=%s body_bytes=%d",
+                slot, envelope.route_kind, envelope.method, envelope.path,
+                len(envelope.body),
+            )
             self._spawn(self._dispatch(envelope))
 
     async def _park_one_intake(self, slot: int) -> _Envelope | None:
+        if not self._owner_token:
+            raise RuntimeError("intake parked before /_system/hello returned an owner_token")
         async with self._send_lock:
             stream_id = self._open_stream_locked(
                 [
@@ -866,6 +952,7 @@ class InkboxTunnelClient:
                     (":authority", self._zone),
                     (":path", "/_system/intake"),
                     ("x-tunnel-id", self._tunnel_id),
+                    ("x-owner-token", self._owner_token),
                     ("x-pool-slot", str(slot)),
                     ("content-length", "0"),
                 ],
@@ -894,6 +981,11 @@ class InkboxTunnelClient:
             return None
         status = next((v for k, v in headers if k == ":status"), "0")
         if status != "200":
+            reason = next((v for k, v in headers if k == "inkbox-reason"), "")
+            logger.warning(
+                "[tunnel-client] /_system/intake slot=%d -> status=%s reason=%r body=%r",
+                slot, status, reason, bytes(body)[:200],
+            )
             return None
         return _parse_envelope(headers, bytes(body))
 
@@ -962,9 +1054,15 @@ class InkboxTunnelClient:
                 if ev is not None:
                     ev.set()
         elif isinstance(event, h2.events.ConnectionTerminated):
+            debug = ""
+            try:
+                if event.additional_data:
+                    debug = event.additional_data.decode("utf-8", errors="replace")
+            except AttributeError:
+                pass
             logger.info(
-                "[tunnel-client] GOAWAY error_code=%s last_stream_id=%s",
-                event.error_code, event.last_stream_id,
+                "[tunnel-client] GOAWAY error_code=%s last_stream_id=%s debug=%r",
+                event.error_code, event.last_stream_id, debug,
             )
             raise ConnectionError("tunnel server sent GOAWAY")
         elif isinstance(event, h2.events.SettingsAcknowledged):
@@ -1072,12 +1170,14 @@ class InkboxTunnelClient:
 
         1. Run the local FastAPI ASGI app's websocket route until it
            sends ``websocket.accept`` (or ``websocket.close``).
-        2. Open an extended-CONNECT stream
+        2. POST ``/_system/response/{ws_id}`` with the chosen subprotocol +
+           accept headers under ``inkbox-h-*``. The tunnel server reads
+           that reply, registers the in-process bridge, and accepts the
+           third-party WS with those headers as the 101 response.
+        3. Open an extended-CONNECT stream
            ``CONNECT :protocol=inkbox-tunnel-ws :path=/_system/ws/{ws_id}``
-           with our chosen subprotocol + accept headers under
-           ``inkbox-h-*``. The tunnel server forwards them to the third
-           party as the 101 response and opens a bidi stream.
-        3. Pump messages: ASGI ``websocket.send`` → length-prefixed JSON
+           — the server now finds the registered bridge and accepts.
+        4. Pump messages: ASGI ``websocket.send`` → length-prefixed JSON
            DATA frame; inbound DATA → ``websocket.receive``.
         """
         if envelope.ws_id is None:
@@ -1112,24 +1212,37 @@ class InkboxTunnelClient:
                 continue
             accept_headers.append((k, v))
 
-        # Open the extended-CONNECT stream.
+        # Step 1: post the upgrade reply on the SAME request_id (=ws_id)
+        # so the public-side handler unblocks, registers the bridge, and
+        # accepts the third-party WS with our chosen subprotocol.
+        # See ws_bridge.py:283-326 in the tunnel server.
+        upgrade_reply_headers: list[tuple[str, str]] = []
+        if subprotocol:
+            upgrade_reply_headers.append(("sec-websocket-protocol", subprotocol))
+        upgrade_reply_headers.extend(accept_headers)
+        await self._post_response(
+            envelope.request_id,
+            status=200,
+            headers=upgrade_reply_headers,
+            body=b"",
+        )
+
+        # Step 2: open the extended-CONNECT stream. Server now has the
+        # bridge registered under ws_id and can pair our stream with it.
+        # ``sec-websocket-version: 13`` is required by hypercorn's
+        # Handshake.is_valid() even on h2 extended CONNECT — without it
+        # hypercorn returns :status=400 before the ASGI handler runs.
         connect_headers: list[tuple[str, str]] = [
             (":method", "CONNECT"),
             (":scheme", "https"),
             (":authority", self._zone),
             (":path", f"/_system/ws/{envelope.ws_id}"),
             (":protocol", "inkbox-tunnel-ws"),
+            ("sec-websocket-version", "13"),
             ("x-tunnel-id", self._tunnel_id),
             ("x-tunnel-secret", self._secret),
-            ("inkbox-request-id", envelope.request_id),
             ("inkbox-ws-id", envelope.ws_id),
         ]
-        if subprotocol:
-            connect_headers.append(
-                ("inkbox-h-sec-websocket-protocol", subprotocol),
-            )
-        for k, v in accept_headers:
-            connect_headers.append((f"inkbox-h-{k.lower()}", v))
 
         async with self._send_lock:
             stream_id = self._open_stream_locked(connect_headers, end_stream=False)
@@ -1172,20 +1285,42 @@ class InkboxTunnelClient:
         )
 
     async def _pump_ws(self, stream_id: int, ws_session: "_WSASGISession") -> None:
-        """Bidirectional ASGI <-> length-prefixed-JSON envelope pump."""
-        recv_buf = bytearray()
+        """Bidirectional ASGI <-> length-prefixed-JSON envelope pump,
+        carried inside RFC-6455 WebSocket frames on the extended-CONNECT
+        stream."""
+        wire_buf = bytearray()           # raw h2 DATA bytes (WS-framed)
+        env_buf = bytearray()            # WS frame payloads concatenated
         recv_done = False
+        data_events_received = 0
+        bytes_received = 0
+        ws_frames_received = 0
+        envelopes_decoded = 0
+        envelope_kind_counts: dict[str, int] = {}
+
+        async def _send_ws_binary(payload: bytes, *, end_stream: bool = False) -> None:
+            await self._send_data(
+                stream_id,
+                _encode_ws_frame(_WS_OPCODE_BINARY, payload, mask=True),
+                end_stream=end_stream,
+            )
 
         async def app_to_wire() -> None:
             try:
                 async for msg in ws_session.outbound():
                     payload = _encode_ws_envelope(msg)
-                    await self._send_data(stream_id, payload, end_stream=False)
-                # ASGI handler completed; signal close.
-                close_payload = _encode_ws_envelope(
+                    await _send_ws_binary(payload, end_stream=False)
+                # ASGI handler completed; signal close on both layers.
+                close_env = _encode_ws_envelope(
                     {"type": "websocket.close", "code": 1000, "reason": ""},
                 )
-                await self._send_data(stream_id, close_payload, end_stream=True)
+                await _send_ws_binary(close_env, end_stream=False)
+                # WS CLOSE frame: 2-byte big-endian status code + optional reason.
+                close_frame_payload = (1000).to_bytes(2, "big")
+                await self._send_data(
+                    stream_id,
+                    _encode_ws_frame(_WS_OPCODE_CLOSE, close_frame_payload, mask=True),
+                    end_stream=True,
+                )
             except (ConnectionError, h2.exceptions.ProtocolError):
                 pass
 
@@ -1195,26 +1330,79 @@ class InkboxTunnelClient:
             while not recv_done:
                 event = await self._streams[stream_id].get()
                 if event.kind == "data":
-                    recv_buf.extend(event.data)
-                    while True:
-                        if len(recv_buf) < 4:
+                    data_events_received += 1
+                    bytes_received += len(event.data)
+                    wire_buf.extend(event.data)
+
+                    # 1) Drain any complete WS frames from the wire buffer.
+                    for opcode, payload, _fin in _decode_ws_frames(wire_buf):
+                        ws_frames_received += 1
+                        if opcode == _WS_OPCODE_PING:
+                            await self._send_data(
+                                stream_id,
+                                _encode_ws_frame(_WS_OPCODE_PONG, payload, mask=True),
+                                end_stream=False,
+                            )
+                            continue
+                        if opcode == _WS_OPCODE_PONG:
+                            continue
+                        if opcode == _WS_OPCODE_CLOSE:
+                            # Echo the close back and stop reading.
+                            try:
+                                await self._send_data(
+                                    stream_id,
+                                    _encode_ws_frame(_WS_OPCODE_CLOSE, payload, mask=True),
+                                    end_stream=True,
+                                )
+                            except (ConnectionError, h2.exceptions.ProtocolError):
+                                pass
+                            recv_done = True
                             break
-                        (length,) = struct.unpack(">I", bytes(recv_buf[:4]))
-                        if len(recv_buf) < 4 + length:
+                        if opcode in (_WS_OPCODE_BINARY, _WS_OPCODE_TEXT):
+                            env_buf.extend(payload)
+                        # ignore continuation/unknown opcodes: WS continuation
+                        # would need fragment reassembly, but the bridge sends
+                        # one envelope per frame with FIN=1 in practice.
+
+                    # 2) Drain length-prefixed envelopes from the WS payload buffer.
+                    while not recv_done:
+                        if len(env_buf) < 4:
                             break
-                        env_bytes = bytes(recv_buf[4:4 + length])
-                        del recv_buf[:4 + length]
+                        (length,) = struct.unpack(">I", bytes(env_buf[:4]))
+                        if len(env_buf) < 4 + length:
+                            break
+                        env_bytes = bytes(env_buf[4:4 + length])
+                        del env_buf[:4 + length]
                         try:
                             envelope_msg = json.loads(env_bytes.decode("utf-8"))
                         except (UnicodeDecodeError, json.JSONDecodeError):
                             continue
+                        envelopes_decoded += 1
+                        kind = envelope_msg.get("type", "<no-type>")
+                        envelope_kind_counts[kind] = envelope_kind_counts.get(kind, 0) + 1
+                        if envelopes_decoded in (1, 5, 50):
+                            logger.info(
+                                "[tunnel-client] ws-pump decoded envelope #%d stream=%d kind=%s data_len=%d",
+                                envelopes_decoded, stream_id, kind,
+                                len(envelope_msg.get("data", "")) if isinstance(envelope_msg.get("data"), str) else 0,
+                            )
                         await ws_session.deliver(envelope_msg)
                         if envelope_msg.get("type") == "close":
                             recv_done = True
                             break
                 elif event.kind in ("end", "reset"):
+                    logger.info(
+                        "[tunnel-client] ws-pump stream=%d ending kind=%s data_events=%d bytes=%d ws_frames=%d envelopes=%d kinds=%s",
+                        stream_id, event.kind, data_events_received, bytes_received,
+                        ws_frames_received, envelopes_decoded, envelope_kind_counts,
+                    )
                     recv_done = True
         finally:
+            logger.info(
+                "[tunnel-client] ws-pump stream=%d EXIT data_events=%d bytes=%d ws_frames=%d envelopes=%d kinds=%s",
+                stream_id, data_events_received, bytes_received,
+                ws_frames_received, envelopes_decoded, envelope_kind_counts,
+            )
             # Clean shutdown: signal the outbound queue with a sentinel
             # so app_to_wire exits its loop on its own. Only fall back
             # to cancel if it's still running after a short grace.
@@ -1549,6 +1737,95 @@ def _build_http_response(
 # ---------------------------------------------------------------------------
 # WebSocket ASGI session
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# WebSocket frame codec (RFC 6455)
+#
+# The bridge stream is a real WebSocket negotiated via RFC-8441 extended
+# CONNECT (`:protocol=inkbox-tunnel-ws`, `sec-websocket-version: 13`).
+# Hypercorn sends/expects standard WS frames on the wire — opcode + length
+# + (mask) + payload — wrapped inside the h2 DATA frames of the CONNECT
+# stream. We have to frame our outbound bytes and parse the inbound bytes
+# accordingly. Server→client frames are unmasked; client→server frames
+# MUST be masked.
+# ---------------------------------------------------------------------------
+
+
+_WS_OPCODE_TEXT = 0x1
+_WS_OPCODE_BINARY = 0x2
+_WS_OPCODE_CLOSE = 0x8
+_WS_OPCODE_PING = 0x9
+_WS_OPCODE_PONG = 0xA
+
+
+def _decode_ws_frames(buf: bytearray) -> list[tuple[int, bytes, bool]]:
+    """
+    Drain as many complete WS frames as possible out of ``buf``.
+
+    Mutates ``buf`` in place; trailing partial frames stay for the next call.
+
+    Returns a list of ``(opcode, payload, fin)`` tuples in arrival order.
+    """
+    frames: list[tuple[int, bytes, bool]] = []
+    while True:
+        if len(buf) < 2:
+            return frames
+        b0 = buf[0]
+        b1 = buf[1]
+        fin = bool(b0 & 0x80)
+        opcode = b0 & 0x0F
+        masked = bool(b1 & 0x80)
+        plen = b1 & 0x7F
+        offset = 2
+        if plen == 126:
+            if len(buf) < 4:
+                return frames
+            plen = int.from_bytes(bytes(buf[2:4]), "big")
+            offset = 4
+        elif plen == 127:
+            if len(buf) < 10:
+                return frames
+            plen = int.from_bytes(bytes(buf[2:10]), "big")
+            offset = 10
+        mask_key = b""
+        if masked:
+            if len(buf) < offset + 4:
+                return frames
+            mask_key = bytes(buf[offset:offset + 4])
+            offset += 4
+        if len(buf) < offset + plen:
+            return frames
+        payload = bytes(buf[offset:offset + plen])
+        if masked and mask_key:
+            payload = bytes(p ^ mask_key[i % 4] for i, p in enumerate(payload))
+        del buf[:offset + plen]
+        frames.append((opcode, payload, fin))
+
+
+def _encode_ws_frame(opcode: int, payload: bytes, *, mask: bool = True) -> bytes:
+    """
+    Encode a single WS frame. ``mask=True`` is required for client→server.
+    """
+    out = bytearray()
+    out.append(0x80 | (opcode & 0x0F))  # FIN=1
+    plen = len(payload)
+    mask_bit = 0x80 if mask else 0x00
+    if plen < 126:
+        out.append(mask_bit | plen)
+    elif plen < 65536:
+        out.append(mask_bit | 126)
+        out += plen.to_bytes(2, "big")
+    else:
+        out.append(mask_bit | 127)
+        out += plen.to_bytes(8, "big")
+    if mask:
+        mask_key = os.urandom(4)
+        out += mask_key
+        out += bytes(p ^ mask_key[i % 4] for i, p in enumerate(payload))
+    else:
+        out += payload
+    return bytes(out)
 
 
 def _encode_ws_envelope(msg: dict[str, Any]) -> bytes:
