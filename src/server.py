@@ -142,7 +142,9 @@ def _serve_loopback_hypercorn(loopback_app: FastAPI, sock: socket.socket) -> asy
 
     config = Config()
     config.bind = [f"fd://{sock.fileno()}"]
-    config.accesslog = None
+    # Stream accesslog to stdout so each passthrough request shows
+    # method / path / status — the only signal we have post-decrypt.
+    config.accesslog = "-"
 
     async def _run() -> None:
         await serve(loopback_app, config)

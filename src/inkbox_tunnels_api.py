@@ -54,8 +54,13 @@ class TunnelsAPI:
     def __exit__(self, *_: Any) -> None:
         self.close()
 
-    def _request(self, method: str, path: str, *, json: Any = None) -> Any:
-        resp = self._client.request(method, path, json=json)
+    def _request(
+        self, method: str, path: str, *, json: Any = None, timeout: float | None = None,
+    ) -> Any:
+        kwargs: dict[str, Any] = {"json": json}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = self._client.request(method, path, **kwargs)
         if resp.status_code >= 400:
             raise TunnelsAPIError(
                 resp.status_code, resp.text, method=method, path=path,
@@ -102,8 +107,13 @@ class TunnelsAPI:
         return self._request("POST", f"/tunnels/{tunnel_id}/rotate-secret")
 
     def sign_csr(self, tunnel_id: UUID | str, csr_pem: str) -> dict[str, Any]:
+        # The server runs the full ACME flow synchronously inside this
+        # request (Route53 TXT write + INSYNC waiter + LE order polling).
+        # 30s isn't enough; LE polling alone can eat that much before
+        # the order transitions to ``valid``.
         return self._request(
             "POST",
             f"/tunnels/{tunnel_id}/sign-csr",
             json={"csr_pem": csr_pem},
+            timeout=180.0,
         )
