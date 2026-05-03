@@ -100,3 +100,10 @@ class EnvConfig():
     INKBOX_TUNNEL_STATE_DIR: str = os.getenv(
         "INKBOX_TUNNEL_STATE_DIR", "./.inkbox-tunnel-state",
     )
+
+    # Loopback hypercorn bind port for passthrough TLS termination. ``0``
+    # auto-picks a free ephemeral port at bind time. The plaintext sink
+    # is bound to ``127.0.0.1`` only — never expose this externally.
+    INKBOX_TUNNEL_LOOPBACK_PORT: int = int(
+        os.getenv("INKBOX_TUNNEL_LOOPBACK_PORT", "0"),
+    )

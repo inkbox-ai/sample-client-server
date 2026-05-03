@@ -33,6 +33,7 @@ import random
 import socket
 import ssl
 import struct
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ from uuid import UUID
 
 import h2.config
 import h2.connection
+import h2.errors
 import h2.events
 import h2.exceptions
 import h2.settings
@@ -79,6 +81,21 @@ class TunnelBundle:
     tls_terminator: "TLSTerminator | None"
 
 
+def _ensure_private_state_dir(state_dir: Path) -> None:
+    """Create ``state_dir`` (if needed) and lock its mode to ``0o700``.
+
+    The ``mode=`` arg to ``Path.mkdir`` is masked by umask and is also
+    ignored entirely on existing directories — a follow-up ``chmod`` is
+    the only reliable way to ensure the directory is owner-only on every
+    code path (first run, reused dir, restrictive umasks).
+    """
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(state_dir, 0o700)
+    except OSError:
+        pass
+
+
 def _load_state(state_dir: Path) -> dict[str, Any] | None:
     state_path = state_dir / _STATE_FILE
     if not state_path.is_file():
@@ -90,7 +107,7 @@ def _load_state(state_dir: Path) -> dict[str, Any] | None:
 
 
 def _save_state(state_dir: Path, state: dict[str, Any]) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_state_dir(state_dir)
     state_path = state_dir / _STATE_FILE
     state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
     try:
@@ -132,7 +149,7 @@ def _load_or_create_keypair(state_dir: Path) -> PrivateKeyTypes:
     # handshakes, and accepted by Let's Encrypt. Both EC and RSA load
     # back through the same load_pem_private_key path.
     logger.info("[bootstrap] generating EC P-256 keypair -> %s", key_path)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_state_dir(state_dir)
     key = ec.generate_private_key(ec.SECP256R1())
     pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -190,6 +207,22 @@ def _maybe_resign_cert(
         or expiry is None
         or expiry - now < _CERT_RENEWAL_THRESHOLD
     )
+    # Even if the cert is in-window, the on-disk private key may have
+    # been regenerated since this cert was signed (the keypair loader
+    # silently regenerates a missing private_key.pem). A pubkey mismatch
+    # would otherwise blow up later inside SSLContext.load_cert_chain
+    # with an obscure error; force a resign here instead.
+    if not needs_sign:
+        try:
+            cached_cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            cert_pub = cached_cert.public_key().public_numbers()
+            key_pub = key.public_key().public_numbers()
+            if cert_pub != key_pub:
+                logger.info("[bootstrap]   key/cert mismatch; resigning CSR")
+                needs_sign = True
+        except (OSError, ValueError, AttributeError):
+            logger.info("[bootstrap]   cached cert unreadable / mismatched; resigning")
+            needs_sign = True
     if not needs_sign and expiry is not None:
         days_left = (expiry - now).days
         logger.info(
@@ -235,7 +268,7 @@ def bootstrap_tunnel() -> TunnelBundle:
         raise RuntimeError("INKBOX_TUNNEL_NAME is required.")
 
     state_dir = Path(EnvConfig.INKBOX_TUNNEL_STATE_DIR)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_state_dir(state_dir)
     name = EnvConfig.INKBOX_TUNNEL_NAME
     zone = EnvConfig.INKBOX_TUNNEL_ZONE
     public_host = f"{name}.{zone}"
@@ -468,6 +501,11 @@ class TLSTerminator:
 
     def __init__(self, *, cert_chain_pem: bytes, key_pem: bytes):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # Negotiate h2 vs h1 against third-party clients. The loopback
+        # plaintext sink (hypercorn) does NOT use ALPN — h2 there comes
+        # via prior-knowledge / h2c upgrade. ALPN is a TLS handshake
+        # extension; setting it on the loopback would be a no-op.
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
         # ssl.SSLContext.load_cert_chain only takes paths, so the PEMs
         # round-trip through tempfiles. To avoid relying on platform
         # default umasks, create with O_CREAT|O_EXCL|O_WRONLY mode 0600
@@ -517,6 +555,10 @@ class TLSSession:
             server_side=True,
         )
         self._handshake_done = False
+
+    @property
+    def handshake_done(self) -> bool:
+        return self._handshake_done
 
     def feed(self, encrypted: bytes) -> tuple[list[bytes], bytes]:
         """
@@ -594,6 +636,11 @@ class _StreamEvent:
     kind: str  # "headers" | "data" | "end" | "reset"
     headers: list[tuple[str, str]] = field(default_factory=list)
     data: bytes = b""
+    # h2 wire-byte count for DATA events (includes h2 padding overhead),
+    # used to credit connection-level flow control on bridge streams
+    # whose deferred-ack lives outside the read loop. ``0`` for
+    # non-DATA events.
+    flow_controlled_length: int = 0
 
 
 @dataclass
@@ -605,6 +652,51 @@ class _Envelope:
     ws_id: str | None
     forwarded_headers: list[tuple[str, str]]
     body: bytes
+    tcp_id: str | None = None
+    sni_host: str | None = None
+
+
+class _BridgeProtocolError(RuntimeError):
+    """Raised by the inbound pump on a wire-format violation."""
+
+
+class _BridgeOpenFailed(RuntimeError):
+    """Raised when CONNECT /_system/tcp/{tcp_id} returns non-200."""
+
+
+class _BridgeStreamReset(RuntimeError):
+    """Raised when the inbound pump sees an h2 RST_STREAM event.
+
+    Distinct from a clean END_STREAM — the bridge is gone, no point
+    letting hypercorn finish an in-flight response.
+    """
+
+
+@dataclass(slots=True)
+class _BridgeStats:
+    tcp_id: str
+    stream_id: int
+    sni_host: str
+    inbound_frames: int = 0
+    outbound_frames: int = 0
+    decrypted_bytes: int = 0
+    encrypted_bytes: int = 0
+    continuation_frames: int = 0
+    tls_handshake_done: bool = False
+    close_reason: str = ""
+
+
+_BRIDGE_STATUS_TIMEOUT_SEC = 10.0
+_BRIDGE_HALF_CLOSE_GRACE_SEC = 5.0
+_BRIDGE_CLEANUP_SEND_TIMEOUT_SEC = 1.0
+_BRIDGE_CLOSE_CODE: dict[str, int] = {
+    "clean-eof": 1000,
+    "protocol-error": 1002,
+    "inbound-error": 1011,
+    "outbound-error": 1011,
+    "tls-error": 1011,
+    "cancelled": 1001,
+}
 
 
 class InkboxTunnelClient:
@@ -624,9 +716,11 @@ class InkboxTunnelClient:
         pool_size: int,
         local_app: Any,
         tls_terminator: TLSTerminator | None,
+        loopback_port: int | None = None,
     ):
         self._tunnel_id = str(tunnel_id)
         self._secret = secret
+        self._loopback_port = loopback_port
         # Per-connection owner token issued by /_system/hello. Required
         # on every /_system/intake stream as `x-owner-token` for the
         # server's fenced-eviction check. Reset on each reconnect.
@@ -656,6 +750,12 @@ class InkboxTunnelClient:
         self._conn_window_event.set()
         # In-flight handler tasks; we wait on them at shutdown.
         self._tasks: set[asyncio.Task[Any]] = set()
+        # Bridge (passthrough TCP) stream ids — the read loop's eager
+        # ack of DATA is suppressed on these, deferred to the pump so
+        # back-pressure propagates into the third-party TCP RWND. Single
+        # event-loop mutation only (dispatch coroutine adds/discards;
+        # _handle_event reads from the same loop).
+        self._bridge_stream_ids: set[int] = set()
 
     async def aclose(self) -> None:
         self._stop.set()
@@ -1030,11 +1130,20 @@ class InkboxTunnelClient:
         elif isinstance(event, h2.events.DataReceived):
             queue = self._streams.get(event.stream_id)
             if queue is not None:
-                await queue.put(_StreamEvent(kind="data", data=event.data))
-            if self._h2 is not None:
+                await queue.put(_StreamEvent(
+                    kind="data",
+                    data=event.data,
+                    flow_controlled_length=event.flow_controlled_length,
+                ))
+            if (
+                self._h2 is not None
+                and event.stream_id not in self._bridge_stream_ids
+            ):
                 self._h2.acknowledge_received_data(
                     event.flow_controlled_length, event.stream_id,
                 )
+            # bridge streams: pump owns the ack call (deferred, behind
+            # _send_lock, so back-pressure tracks third-party TCP RWND).
         elif isinstance(event, h2.events.StreamEnded):
             queue = self._streams.get(event.stream_id)
             if queue is not None:
@@ -1073,10 +1182,31 @@ class InkboxTunnelClient:
     # --- envelope dispatch --------------------------------------------------
 
     async def _dispatch(self, envelope: _Envelope) -> None:
-        try:
-            if envelope.route_kind == "ws-upgrade":
+        if envelope.route_kind == "ws-upgrade":
+            try:
                 await self._dispatch_ws_upgrade(envelope)
-                return
+            except Exception:
+                logger.exception(
+                    "[tunnel-client] ws dispatch failed request_id=%s",
+                    envelope.request_id,
+                )
+            return
+        if envelope.route_kind == "tcp-stream":
+            # Bridge cleanup (RST_STREAM, WS CLOSE, drain-and-ack,
+            # loopback teardown) is owned by _dispatch_tcp_stream's
+            # finally. The server has no response listener for tcp_id,
+            # so we must NOT _post_response on exception — that would
+            # leak a response stream and the third-party socket sits
+            # parked until the server's BIND_TIMEOUT.
+            try:
+                await self._dispatch_tcp_stream(envelope)
+            except Exception:
+                logger.exception(
+                    "[tunnel-client] tcp-stream dispatch failed tcp_id=%s",
+                    envelope.tcp_id,
+                )
+            return
+        try:
             await self._dispatch_http(envelope)
         except Exception:
             logger.exception(
@@ -1095,67 +1225,27 @@ class InkboxTunnelClient:
     # --- HTTP envelope dispatch (edge + passthrough) ------------------------
 
     async def _dispatch_http(self, envelope: _Envelope) -> None:
+        # Edge mode only — passthrough never reaches here. Passthrough
+        # arrives as ``route_kind=tcp-stream`` and is handled by
+        # ``_dispatch_tcp_stream`` (raw bytes through the bridge stream,
+        # decrypted with TLSSession, fed into the loopback hypercorn).
         disconnect_event = asyncio.Event()
         if self._stop.is_set():
             disconnect_event.set()
         try:
-            if self._terminator is None:
-                # Edge mode: envelope body is already plaintext request body.
-                status, resp_headers, resp_body = await _invoke_asgi_http(
-                    app=self._app,
-                    method=envelope.method,
-                    path=envelope.path,
-                    headers=envelope.forwarded_headers,
-                    body=envelope.body,
-                    disconnect_event=disconnect_event,
-                )
-                await self._post_response(
-                    envelope.request_id,
-                    status=status,
-                    headers=_filter_response_headers(resp_headers),
-                    body=resp_body,
-                )
-                return
-
-            # Passthrough mode: envelope.body is encrypted bytes from
-            # the third-party TCP stream (TLS records). Drive the BIO
-            # until a full HTTP/1.1 request is parseable, dispatch,
-            # encrypt response.
-            session = self._terminator.session()
-            plaintext_chunks, _ = session.feed(envelope.body)
-            plaintext = bytearray(b"".join(plaintext_chunks))
-            try:
-                method, path, req_headers, body = _parse_complete_http_request(
-                    plaintext,
-                )
-            except _NeedMoreData:
-                await self._post_response(
-                    envelope.request_id,
-                    status=400,
-                    headers=[("content-type", "text/plain")],
-                    body=b"passthrough: incomplete HTTP/1.1 request",
-                )
-                return
-
             status, resp_headers, resp_body = await _invoke_asgi_http(
                 app=self._app,
-                method=method,
-                path=path,
-                headers=req_headers,
-                body=body,
+                method=envelope.method,
+                path=envelope.path,
+                headers=envelope.forwarded_headers,
+                body=envelope.body,
                 disconnect_event=disconnect_event,
             )
-            wire_response = _build_http_response(
-                status, _filter_response_headers(resp_headers), resp_body,
-            )
-            encrypted = session.send(wire_response)
-            encrypted += session.close()
             await self._post_response(
                 envelope.request_id,
-                status=200,
-                headers=[("content-type", "application/octet-stream")],
-                body=bytes(encrypted),
-                opaque=True,
+                status=status,
+                headers=_filter_response_headers(resp_headers),
+                body=resp_body,
             )
         finally:
             # Unblock any handler still parked in receive() so the task
@@ -1275,6 +1365,428 @@ class InkboxTunnelClient:
         finally:
             await ws_session.close(code=1000)
             self._streams.pop(stream_id, None)
+
+    # --- TCP-stream bridge (passthrough TLS termination) -------------------
+
+    async def _dispatch_tcp_stream(self, envelope: _Envelope) -> None:
+        """Bridge a third-party TCP stream end-to-end in passthrough mode.
+
+        Wire shape: raw third-party bytes ride WS BINARY frames on a
+        dedicated extended-CONNECT stream (``:protocol=inkbox-tunnel-tcp``,
+        ``:path=/_system/tcp/{tcp_id}``). The first inbound frame is the
+        peeked TLS ClientHello prefix. We terminate TLS via TLSSession,
+        feed plaintext into a loopback hypercorn ASGI server, encrypt
+        the response, frame it as WS BINARY, send it back.
+        """
+        assert self._terminator is not None
+        assert envelope.tcp_id
+        assert self._loopback_port is not None
+        tcp_id = envelope.tcp_id
+        sni_host = envelope.sni_host or ""
+
+        # 1. Open the bridge CONNECT stream FIRST. If we dialed loopback
+        #    first and it failed, the server-side TCPBridge would sit
+        #    registered until BIND_TIMEOUT.
+        connect_headers: list[tuple[str, str]] = [
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", self._zone),
+            (":path", f"/_system/tcp/{tcp_id}"),
+            (":protocol", "inkbox-tunnel-tcp"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-protocol", "inkbox-tunnel-tcp"),
+            ("x-tunnel-id", self._tunnel_id),
+            ("x-tunnel-secret", self._secret),
+            ("inkbox-tcp-id", tcp_id),
+        ]
+
+        async with self._send_lock:
+            stream_id = self._open_stream_locked(
+                connect_headers, end_stream=False,
+            )
+            # Tag the stream BEFORE _flush() puts CONNECT on the wire,
+            # so _handle_event's eager-ack suppression catches the
+            # ClientHello replay DATA that arrives back-to-back with
+            # the response headers.
+            self._bridge_stream_ids.add(stream_id)
+            try:
+                await self._flush()
+            except Exception:
+                self._bridge_stream_ids.discard(stream_id)
+                self._streams.pop(stream_id, None)
+                raise
+
+        # 2. Wait for :status=200 with a hard timeout. Consume only the
+        #    headers event — the inbound pump must see the queued DATA
+        #    (replayed ClientHello) that arrives right behind 200.
+        async def _await_bridge_status_200() -> None:
+            queue = self._streams[stream_id]
+            while True:
+                event = await queue.get()
+                if event.kind == "headers":
+                    status_str = next(
+                        (v for k, v in event.headers if k == ":status"),
+                        "0",
+                    )
+                    if status_str != "200":
+                        raise _BridgeOpenFailed(f"status={status_str}")
+                    return
+                if event.kind in ("end", "reset"):
+                    raise _BridgeOpenFailed(f"stream {event.kind} before 200")
+                # RFC 7540 §8.1: HEADERS must precede DATA on a stream.
+                # Pre-headers DATA is a server-side protocol violation;
+                # fail loud rather than silently eating the bytes.
+                raise _BridgeProtocolError(
+                    f"unexpected pre-headers event kind={event.kind}",
+                )
+
+        try:
+            await asyncio.wait_for(
+                _await_bridge_status_200(),
+                timeout=_BRIDGE_STATUS_TIMEOUT_SEC,
+            )
+        except (
+            asyncio.TimeoutError,
+            _BridgeOpenFailed,
+            _BridgeProtocolError,
+        ):
+            logger.exception(
+                "[tunnel-client] bridge open failed tcp_id=%s", tcp_id,
+            )
+            # ORDER MATTERS: drain+ack first (h2 reclaims stream window
+            # on RST_STREAM but NOT connection window), then reset.
+            await self._drain_and_ack_pending(stream_id)
+            async with self._send_lock:
+                if self._h2 is not None:
+                    with suppress(
+                        h2.exceptions.StreamClosedError,
+                        h2.exceptions.NoSuchStreamError,
+                        h2.exceptions.ProtocolError,
+                    ):
+                        self._h2.reset_stream(
+                            stream_id,
+                            error_code=h2.errors.ErrorCodes.CANCEL,
+                        )
+                        await self._flush()
+            self._bridge_stream_ids.discard(stream_id)
+            self._streams.pop(stream_id, None)
+            return
+
+        # 3. Dial loopback hypercorn. On failure, send WS CLOSE 1011 so
+        #    the server tears down its bridge handler immediately.
+        try:
+            lb_reader, lb_writer = await asyncio.open_connection(
+                "127.0.0.1", self._loopback_port,
+            )
+        except OSError:
+            logger.exception(
+                "[tunnel-client] loopback dial failed tcp_id=%s", tcp_id,
+            )
+            close_payload = (1011).to_bytes(2, "big") + b"loopback-dial-failed"
+            with suppress(Exception, asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self._send_data(
+                        stream_id,
+                        _encode_ws_frame(
+                            _WS_OPCODE_CLOSE, close_payload, mask=True,
+                        ),
+                        end_stream=True,
+                    ),
+                    timeout=_BRIDGE_CLEANUP_SEND_TIMEOUT_SEC,
+                )
+            await self._drain_and_ack_pending(stream_id)
+            self._bridge_stream_ids.discard(stream_id)
+            self._streams.pop(stream_id, None)
+            return
+
+        # 4. Build per-bridge state.
+        stats = _BridgeStats(
+            tcp_id=tcp_id,
+            stream_id=stream_id,
+            sni_host=sni_host,
+        )
+        logger.info(
+            "[tunnel-client] tcp-stream open tcp_id=%s stream_id=%d "
+            "sni=%s loopback_port=%d",
+            tcp_id, stream_id, sni_host, self._loopback_port,
+        )
+
+        tls_session = self._terminator.session()
+        tls_lock = asyncio.Lock()
+        tls_closed = False
+        close_reason = "clean-eof"
+
+        async def maybe_close_tls() -> bytes:
+            nonlocal tls_closed
+            async with tls_lock:
+                if tls_closed:
+                    return b""
+                tls_closed = True
+                return tls_session.close()
+
+        def _half_close_loopback() -> None:
+            try:
+                lb_writer.write_eof()
+            except (OSError, ConnectionError):
+                pass
+
+        async def _send_ws_frame(
+            opcode: int, payload: bytes, *, end_stream: bool = False,
+        ) -> None:
+            await self._send_data(
+                stream_id,
+                _encode_ws_frame(opcode, payload, mask=True),
+                end_stream=end_stream,
+            )
+
+        async def inbound() -> None:
+            wire_buf = bytearray()
+            pending_frags: bytearray | None = None
+            unacked_wire_bytes = 0
+            try:
+                while True:
+                    event = await self._streams[stream_id].get()
+                    if event.kind == "end":
+                        _half_close_loopback()
+                        return
+                    if event.kind == "reset":
+                        raise _BridgeStreamReset("inbound stream reset")
+                    if event.kind != "data":
+                        continue
+                    unacked_wire_bytes += event.flow_controlled_length
+                    wire_buf.extend(event.data)
+                    for opcode, payload, fin in _decode_ws_frames(wire_buf):
+                        if opcode == _WS_OPCODE_PING:
+                            await _send_ws_frame(_WS_OPCODE_PONG, payload)
+                            continue
+                        if opcode == _WS_OPCODE_CLOSE:
+                            _half_close_loopback()
+                            return
+                        if opcode == _WS_OPCODE_PONG:
+                            continue
+                        if opcode == _WS_OPCODE_TEXT:
+                            logger.warning(
+                                "[tunnel-client] tcp-stream got TEXT frame "
+                                "tcp_id=%s; closing", tcp_id,
+                            )
+                            raise _BridgeProtocolError("unexpected TEXT frame")
+                        if opcode == 0x0:
+                            if pending_frags is None:
+                                raise _BridgeProtocolError(
+                                    "continuation without start frame",
+                                )
+                            pending_frags.extend(payload)
+                            stats.continuation_frames += 1
+                        elif opcode == _WS_OPCODE_BINARY:
+                            # RFC 6455 §5.4: a new data frame is illegal
+                            # while a fragmented message is still open.
+                            if pending_frags is not None:
+                                raise _BridgeProtocolError(
+                                    "new BINARY frame while fragmented "
+                                    "message open",
+                                )
+                            pending_frags = bytearray(payload)
+                        else:
+                            raise _BridgeProtocolError(
+                                f"unexpected opcode {opcode:#x}",
+                            )
+                        if not fin:
+                            continue
+                        chunk = bytes(pending_frags)
+                        pending_frags = None
+
+                        async with tls_lock:
+                            plaintext_chunks, handshake_out = tls_session.feed(chunk)
+                        if handshake_out:
+                            await _send_ws_frame(_WS_OPCODE_BINARY, handshake_out)
+                            stats.outbound_frames += 1
+                            stats.encrypted_bytes += len(handshake_out)
+                        for pt in plaintext_chunks:
+                            lb_writer.write(pt)
+                        if plaintext_chunks:
+                            await lb_writer.drain()
+                        stats.inbound_frames += 1
+                        stats.decrypted_bytes += sum(
+                            len(pt) for pt in plaintext_chunks
+                        )
+                        if (
+                            not stats.tls_handshake_done
+                            and tls_session.handshake_done
+                        ):
+                            stats.tls_handshake_done = True
+
+                    pending_payload = (
+                        len(pending_frags) if pending_frags else 0
+                    )
+                    consumed = (
+                        unacked_wire_bytes
+                        - len(wire_buf)
+                        - pending_payload
+                    )
+                    if consumed > 0:
+                        unacked_wire_bytes -= consumed
+                        async with self._send_lock:
+                            if self._h2 is not None:
+                                with suppress(
+                                    h2.exceptions.StreamClosedError,
+                                    h2.exceptions.NoSuchStreamError,
+                                    h2.exceptions.ProtocolError,
+                                ):
+                                    self._h2.acknowledge_received_data(
+                                        consumed, stream_id,
+                                    )
+                                    await self._flush()
+            finally:
+                # Ack any pump-local unacked bytes — _drain_and_ack_pending
+                # only sees the queue, not these locals. Do NOT `return`
+                # from this finally; that would swallow propagating
+                # exceptions (e.g. _BridgeProtocolError on a bad opcode).
+                if unacked_wire_bytes:
+                    async with self._send_lock:
+                        if self._h2 is not None:
+                            with suppress(
+                                h2.exceptions.StreamClosedError,
+                                h2.exceptions.NoSuchStreamError,
+                                h2.exceptions.ProtocolError,
+                            ):
+                                self._h2.acknowledge_received_data(
+                                    unacked_wire_bytes, stream_id,
+                                )
+                                await self._flush()
+
+        async def outbound() -> None:
+            while True:
+                try:
+                    plaintext = await lb_reader.read(16 * 1024)
+                except (ConnectionError, asyncio.IncompleteReadError):
+                    break
+                if not plaintext:
+                    break
+                async with tls_lock:
+                    encrypted = tls_session.send(plaintext)
+                if encrypted:
+                    await _send_ws_frame(_WS_OPCODE_BINARY, encrypted)
+                    stats.outbound_frames += 1
+                    stats.encrypted_bytes += len(encrypted)
+            tail = await maybe_close_tls()
+            if tail:
+                await _send_ws_frame(_WS_OPCODE_BINARY, tail)
+
+        in_task = asyncio.create_task(inbound())
+        out_task = asyncio.create_task(outbound())
+        try:
+            done, pending = await asyncio.wait(
+                {in_task, out_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            pending_list = list(pending)
+
+            try:
+                for t in done:
+                    t.result()
+            except _BridgeProtocolError:
+                close_reason = "protocol-error"
+                raise
+            except _BridgeStreamReset:
+                close_reason = "inbound-error"
+                raise
+            except ssl.SSLError:
+                close_reason = "tls-error"
+                raise
+            except Exception:
+                close_reason = (
+                    "inbound-error" if in_task in done else "outbound-error"
+                )
+                raise
+
+            # Asymmetric grace: outbound-finishes-first cancels inbound
+            # immediately (response delivered, no point waiting on
+            # keep-alive); inbound-finishes-first runs grace timer so
+            # outbound can drain the in-flight response.
+            if (
+                out_task in done
+                and out_task.exception() is None
+            ):
+                in_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await in_task
+            else:
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*pending_list, return_exceptions=True),
+                        timeout=_BRIDGE_HALF_CLOSE_GRACE_SEC,
+                    )
+                    for t, r in zip(pending_list, results):
+                        if isinstance(r, _BridgeProtocolError):
+                            close_reason = "protocol-error"
+                        elif isinstance(r, _BridgeStreamReset):
+                            close_reason = "inbound-error"
+                        elif isinstance(r, ssl.SSLError):
+                            close_reason = "tls-error"
+                        elif isinstance(r, Exception):
+                            close_reason = (
+                                "inbound-error" if t is in_task
+                                else "outbound-error"
+                            )
+                except asyncio.TimeoutError:
+                    close_reason = "cancelled"
+                    for t in pending_list:
+                        t.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await asyncio.gather(
+                            *pending_list, return_exceptions=True,
+                        )
+        except asyncio.CancelledError:
+            close_reason = "cancelled"
+            raise
+        finally:
+            for t in (in_task, out_task):
+                if not t.done():
+                    t.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.gather(
+                    in_task, out_task, return_exceptions=True,
+                )
+            ws_close_code = _BRIDGE_CLOSE_CODE.get(close_reason, 1011)
+            stats.close_reason = close_reason
+
+            tail = await maybe_close_tls()
+            if tail:
+                with suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        _send_ws_frame(_WS_OPCODE_BINARY, tail),
+                        timeout=_BRIDGE_CLEANUP_SEND_TIMEOUT_SEC,
+                    )
+
+            reason_bytes = close_reason.encode("utf-8")[:123]
+            close_payload = ws_close_code.to_bytes(2, "big") + reason_bytes
+            with suppress(
+                h2.exceptions.StreamClosedError,
+                Exception,
+                asyncio.TimeoutError,
+            ):
+                await asyncio.wait_for(
+                    _send_ws_frame(
+                        _WS_OPCODE_CLOSE, close_payload, end_stream=True,
+                    ),
+                    timeout=_BRIDGE_CLEANUP_SEND_TIMEOUT_SEC,
+                )
+
+            with suppress(Exception):
+                await self._drain_and_ack_pending(stream_id)
+
+            with suppress(Exception):
+                lb_writer.close()
+                await lb_writer.wait_closed()
+
+            self._bridge_stream_ids.discard(stream_id)
+            self._streams.pop(stream_id, None)
+            logger.info(
+                "[tunnel-client] tcp-stream closed tcp_id=%s stream_id=%s "
+                "sni=%s reason=%s ws_code=%d stats=%s",
+                tcp_id, stream_id, sni_host,
+                close_reason, ws_close_code, stats,
+            )
 
     async def _reject_ws(self, request_id: str, *, status: int, reason: str) -> None:
         await self._post_response(
@@ -1427,14 +1939,8 @@ class InkboxTunnelClient:
         status: int,
         headers: list[tuple[str, str]],
         body: bytes,
-        opaque: bool = False,
     ) -> None:
-        """
-        POST /_system/response/{id} on the existing h2 connection.
-        ``opaque=True`` flags passthrough-mode encrypted bytes; we set
-        ``inkbox-route-kind=tcp-passthrough`` so the public handler
-        forwards them as opaque TCP rather than HTTP.
-        """
+        """POST /_system/response/{id} on the existing h2 connection."""
         req_headers: list[tuple[str, str]] = [
             (":method", "POST"),
             (":scheme", "https"),
@@ -1446,8 +1952,6 @@ class InkboxTunnelClient:
             ("inkbox-request-id", request_id),
             ("content-length", str(len(body))),
         ]
-        if opaque:
-            req_headers.append(("inkbox-route-kind", "tcp-passthrough"))
         # Drop any inbound content-length / transfer-encoding before
         # forwarding under inkbox-h-* — the outer content-length set on
         # this stream is the source of truth for the wire body length.
@@ -1528,6 +2032,41 @@ class InkboxTunnelClient:
         if self._h2 is not None and self._h2.outbound_flow_control_window <= 0:
             self._conn_window_event.clear()
 
+    async def _drain_and_ack_pending(self, stream_id: int) -> None:
+        """Reclaim connection-level flow window for queued-but-unprocessed
+        DATA on a bridge stream that's about to be popped.
+
+        Called from cleanup paths only. h2 reclaims stream window on
+        RST_STREAM but NOT connection window — leaking bytes here
+        shrinks the shared connection window across bridge cleanups
+        until unrelated streams stall. Both ``acknowledge_received_data``
+        and the trailing ``_flush()`` are inside the suppress block:
+        cleanup must not crash if the underlying transport is half-
+        torn-down.
+        """
+        queue = self._streams.get(stream_id)
+        if queue is None or self._h2 is None:
+            return
+        total = 0
+        while not queue.empty():
+            event = queue.get_nowait()
+            if event.kind == "data":
+                total += event.flow_controlled_length
+        if not total:
+            return
+        async with self._send_lock:
+            # Re-check under the lock: _h2 can be torn down by
+            # aclose() / reconnect while we awaited the lock.
+            if self._h2 is None:
+                return
+            with suppress(
+                h2.exceptions.StreamClosedError,
+                h2.exceptions.NoSuchStreamError,
+                h2.exceptions.ProtocolError,
+            ):
+                self._h2.acknowledge_received_data(total, stream_id)
+                await self._flush()
+
     async def _await_window(self, stream_id: int) -> None:
         async with self._send_lock:
             if self._h2 is None:
@@ -1568,16 +2107,14 @@ class InkboxTunnelClient:
 # ---------------------------------------------------------------------------
 
 
-class _NeedMoreData(Exception):
-    """Internal signal: passthrough plaintext is not yet a full HTTP request."""
-
-
 def _parse_envelope(headers: list[tuple[str, str]], body: bytes) -> _Envelope | None:
     request_id = ""
     method = "GET"
     path = "/"
     route_kind = "webhook"
     ws_id: str | None = None
+    tcp_id: str | None = None
+    sni_host: str | None = None
     forwarded: list[tuple[str, str]] = []
     for k, v in headers:
         if k == "inkbox-request-id":
@@ -1590,6 +2127,10 @@ def _parse_envelope(headers: list[tuple[str, str]], body: bytes) -> _Envelope | 
             route_kind = v
         elif k == "inkbox-ws-id":
             ws_id = v
+        elif k == "inkbox-tcp-id":
+            tcp_id = v
+        elif k == "inkbox-sni-host":
+            sni_host = v
         elif k.startswith("inkbox-h-"):
             forwarded.append((k.removeprefix("inkbox-h-"), v))
     if not request_id:
@@ -1602,6 +2143,8 @@ def _parse_envelope(headers: list[tuple[str, str]], body: bytes) -> _Envelope | 
         ws_id=ws_id,
         forwarded_headers=forwarded,
         body=body,
+        tcp_id=tcp_id,
+        sni_host=sni_host,
     )
 
 
@@ -1672,66 +2215,6 @@ async def _invoke_asgi_http(
 
     await app(scope, receive, send)
     return response_status, response_headers, bytes(response_body)
-
-
-def _parse_complete_http_request(
-    buf: bytes,
-) -> tuple[str, str, list[tuple[str, str]], bytes]:
-    """Strict HTTP/1.1 request parser; honors Content-Length only."""
-    head, sep, rest = bytes(buf).partition(b"\r\n\r\n")
-    if not sep:
-        raise _NeedMoreData()
-    lines = head.split(b"\r\n")
-    if not lines:
-        raise _NeedMoreData()
-    request_line = lines[0].decode("latin-1")
-    parts = request_line.split(" ", 2)
-    method = parts[0] if parts else "GET"
-    path = parts[1] if len(parts) > 1 else "/"
-    headers: list[tuple[str, str]] = []
-    content_length = 0
-    for raw in lines[1:]:
-        if not raw:
-            continue
-        k, _, v = raw.decode("latin-1").partition(":")
-        key = k.strip().lower()
-        val = v.strip()
-        headers.append((key, val))
-        if key == "content-length":
-            try:
-                content_length = int(val)
-            except ValueError:
-                content_length = 0
-    if len(rest) < content_length:
-        raise _NeedMoreData()
-    body = rest[:content_length]
-    return method, path, headers, body
-
-
-def _build_http_response(
-    status: int,
-    headers: list[tuple[str, str]],
-    body: bytes,
-) -> bytes:
-    reason = {
-        200: "OK", 201: "Created", 204: "No Content",
-        301: "Moved Permanently", 302: "Found", 304: "Not Modified",
-        400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
-        404: "Not Found", 405: "Method Not Allowed", 413: "Payload Too Large",
-        422: "Unprocessable Entity", 500: "Internal Server Error",
-        502: "Bad Gateway", 503: "Service Unavailable",
-    }.get(status, "OK")
-    lines = [f"HTTP/1.1 {status} {reason}"]
-    has_cl = any(k.lower() == "content-length" for k, _ in headers)
-    has_conn = any(k.lower() == "connection" for k, _ in headers)
-    for k, v in headers:
-        lines.append(f"{k}: {v}")
-    if not has_cl:
-        lines.append(f"content-length: {len(body)}")
-    if not has_conn:
-        lines.append("connection: close")
-    head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
-    return head + body
 
 
 # ---------------------------------------------------------------------------
