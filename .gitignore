@@ -214,6 +214,3 @@ payloads/
 # Inkbox tunnel state (connect secret + passthrough keypair/cert).
 # Glob covers per-mode dirs like .inkbox-tunnel-state-pt/.
 .inkbox-tunnel-state*/
-
-tunnel-context.md
-client-side-tls-termination-plan.md
