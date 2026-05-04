@@ -656,6 +656,18 @@ class _Envelope:
     sni_host: str | None = None
 
 
+class _OwnerTokenInvalidError(RuntimeError):
+    """
+    Raised when the tunnel server rejects our owner_token (HTTP 401).
+
+    The server forgot or replaced our session — typically because the
+    server task got recycled, or because a sibling worker without our
+    in-memory state answered the next stream. Retrying with the same
+    owner_token will keep failing; we must drop the h2 connection and
+    reconnect (which mints a fresh owner_token via /_system/hello).
+    """
+
+
 class _BridgeProtocolError(RuntimeError):
     """Raised by the inbound pump on a wire-format violation."""
 
@@ -765,6 +777,21 @@ class InkboxTunnelClient:
                 await self._writer.wait_closed()
             except (OSError, ConnectionError):
                 pass
+
+    def _force_reconnect(self) -> None:
+        """
+        Tear down the current h2 transport without setting ``_stop``.
+
+        ``_read_loop`` sees EOF and returns; ``_run_once`` finalizes;
+        ``serve_forever``'s outer loop then reconnects (mints a fresh
+        owner_token via ``/_system/hello``). Idempotent — safe to call
+        from multiple intake slots racing on the same 401.
+        """
+        writer = self._writer
+        if writer is None:
+            return
+        with suppress(Exception):
+            writer.close()
 
     async def serve_forever(self) -> None:
         """Maintain the connection with jittered exponential-backoff reconnects.
@@ -1025,6 +1052,17 @@ class InkboxTunnelClient:
                 envelope = await self._park_one_intake(slot)
             except asyncio.CancelledError:
                 raise
+            except _OwnerTokenInvalidError:
+                # Don't retry-storm against a server that has forgotten us
+                # — close the transport so _read_loop returns and
+                # serve_forever's outer reconnect loop picks up cleanly.
+                logger.warning(
+                    "[tunnel-client] intake slot %d: owner_token rejected; "
+                    "dropping connection to force reconnect",
+                    slot,
+                )
+                self._force_reconnect()
+                return
             except Exception:
                 logger.exception(
                     "[tunnel-client] intake slot %d transient error; retrying",
@@ -1082,10 +1120,15 @@ class InkboxTunnelClient:
         status = next((v for k, v in headers if k == ":status"), "0")
         if status != "200":
             reason = next((v for k, v in headers if k == "inkbox-reason"), "")
+            body_bytes = bytes(body)[:200]
             logger.warning(
                 "[tunnel-client] /_system/intake slot=%d -> status=%s reason=%r body=%r",
-                slot, status, reason, bytes(body)[:200],
+                slot, status, reason, body_bytes,
             )
+            if status == "401":
+                raise _OwnerTokenInvalidError(
+                    f"slot={slot} status=401 reason={reason!r} body={body_bytes!r}",
+                )
             return None
         return _parse_envelope(headers, bytes(body))
 
