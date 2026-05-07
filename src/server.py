@@ -26,6 +26,7 @@ import json
 import logging
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
