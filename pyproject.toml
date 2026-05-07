@@ -7,12 +7,14 @@ description = "Sample Inkbox webhook receiver + phone media WebSocket server (si
 requires-python = ">=3.12"
 dependencies = [
   "aiohttp>=3.13.4", # async HTTP client/server
+  "cryptography>=42.0.0", # passthrough mode: keygen + CSR + TLS termination
   "fastapi>=0.115.12",
-  "httpx>=0.28.1",
+  "h2>=4.1.0", # raw HTTP/2 frame control for parked intake streams
+  "httpx[http2]>=0.28.1",
+  "hypercorn>=0.17.3", # passthrough mode loopback ASGI server (h2 + h2c + WS)
   "inkbox==0.2.10",
   "openai>=1.99.0",
   "pydantic>=2.11.4",
-  "pyngrok>=7.2.0",
   "python-dotenv>=1.1.0",
   "python-multipart>=0.0.20",
   "uvicorn[standard]>=0.34.3",

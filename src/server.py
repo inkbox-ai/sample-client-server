@@ -22,13 +22,18 @@ request using those same Pydantic models.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
+import socket
 import time
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from data_models.tunnel import TunnelTLSMode
+from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 from inkbox import verify_webhook
 from pydantic import ValidationError
@@ -50,15 +55,187 @@ from data_models.webhooks import (
     PhoneIncomingTextWebhookPayload,
 )
 from env_config import EnvConfig
-from ngrok_bootstrap import setup_ngrok_and_patch_inkbox
+from inkbox_tunnel_bootstrap import (
+    InkboxTunnelClient,
+    bootstrap_tunnel,
+    patch_inkbox_objects_to_tunnel,
+)
 from phone_agent import PhoneAgent
+from realtime_phone_agent import run_realtime_bridge
+
+
+# Handshake response headers used when ``USE_OPENAI_REALTIME=true``: opt
+# out of Inkbox-managed STT/TTS so the platform sends raw caller audio
+# as ``media`` events and forwards our ``media`` events to the caller.
+REALTIME_HANDSHAKE_RESPONSE_HEADERS: dict[str, str] = {
+    "X-Use-Inkbox-Text-To-Speech": "false",
+    "X-Use-Inkbox-Speech-To-Text": "false",
+}
 
 logger = logging.getLogger(__name__)
+
+
+_HEALTHY_STATUS_RE = re.compile(rb"^HTTP/\d\.\d 2\d\d\b")
+_LOOPBACK_HEALTH_TIMEOUT_SEC = 5.0
+
+
+async def _loopback_healthy(port: int, timeout: float = _LOOPBACK_HEALTH_TIMEOUT_SEC) -> bool:
+    """HTTP /__loopback_health probe that proves the ASGI app is up.
+
+    A bare TCP connect is not enough: ``main()`` already called
+    ``listen()`` on the loopback socket, so the kernel SYN-ACKs even
+    if hypercorn crashed before installing an accept handler. Drive
+    a real HTTP request through the app to confirm it's serving.
+    """
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port),
+            timeout=timeout,
+        )
+    except (OSError, asyncio.TimeoutError):
+        return False
+    try:
+        writer.write(
+            b"GET /__loopback_health HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        status_line = await asyncio.wait_for(
+            reader.readline(), timeout=timeout,
+        )
+        return bool(_HEALTHY_STATUS_RE.match(status_line))
+    except (OSError, asyncio.TimeoutError):
+        return False
+    finally:
+        with suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
+
+
+async def _await_loopback_until_healthy(port: int, deadline_sec: float = 10.0) -> bool:
+    """Probe loopback every 100 ms until healthy or deadline expires."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + deadline_sec
+    while loop.time() < deadline:
+        if await _loopback_healthy(port, timeout=1.0):
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
+def _serve_loopback_hypercorn(loopback_app: FastAPI, sock: socket.socket) -> asyncio.Task[None]:
+    """Spawn hypercorn serving ``loopback_app`` on the pre-bound socket.
+
+    Hypercorn's ``fd://N`` bind syntax wraps the existing fd in a new
+    socket object without re-binding or re-listening — the only way to
+    hand it a socket main() already owns. ``set_inheritable`` keeps the
+    fd alive across the wrap.
+    """
+    from hypercorn.asyncio import serve  # noqa: PLC0415
+    from hypercorn.config import Config  # noqa: PLC0415
+
+    try:
+        sock.set_inheritable(True)
+    except AttributeError:
+        pass
+
+    config = Config()
+    config.bind = [f"fd://{sock.fileno()}"]
+    # Stream accesslog to stdout so each passthrough request shows
+    # method / path / status — the only signal we have post-decrypt.
+    config.accesslog = "-"
+
+    async def _run() -> None:
+        await serve(loopback_app, config)
+
+    return asyncio.create_task(_run())
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run the loopback hypercorn (passthrough only) and the persistent
+    tunnel-client connection for the life of the app."""
+    client: InkboxTunnelClient | None = getattr(app.state, "tunnel_client", None)
+    loopback_sock: socket.socket | None = getattr(app.state, "loopback_sock", None)
+    loopback_app_obj: FastAPI | None = getattr(app.state, "loopback_app", None)
+    loopback_task: asyncio.Task[None] | None = None
+    tunnel_task: asyncio.Task[None] | None = None
+
+    if loopback_sock is not None and loopback_app_obj is not None:
+        loopback_port = loopback_sock.getsockname()[1]
+        # Share state with the loopback app so any future route reading
+        # request.app.state.tunnel_client sees the same instance.
+        loopback_app_obj.state.tunnel_client = client
+        loopback_task = _serve_loopback_hypercorn(loopback_app_obj, loopback_sock)
+        logger.info(
+            "[passthrough] loopback hypercorn starting on 127.0.0.1:%d",
+            loopback_port,
+        )
+        if not await _await_loopback_until_healthy(loopback_port):
+            logger.error(
+                "[passthrough] loopback /__loopback_health did not respond 2xx; "
+                "REFUSING to start the tunnel client. Process stays up so the "
+                "failure surfaces to monitoring.",
+            )
+            client = None  # short-circuit tunnel-client startup below
+        else:
+            logger.info(
+                "[passthrough] loopback /__loopback_health OK on port %d",
+                loopback_port,
+            )
+
+    if client is not None:
+        tunnel_task = asyncio.create_task(client.serve_forever())
+    try:
+        yield
+    finally:
+        if client is not None:
+            await client.aclose()
+        if tunnel_task is not None:
+            tunnel_task.cancel()
+            try:
+                await tunnel_task
+            except asyncio.CancelledError:
+                pass
+        if loopback_task is not None:
+            loopback_task.cancel()
+            try:
+                await loopback_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if loopback_sock is not None:
+            with suppress(Exception):
+                loopback_sock.close()
+
 
 app = FastAPI(
     title="Inkbox sample client/server",
     version="0.1.0",
+    lifespan=lifespan,
 )
+
+
+# Loopback ASGI surface for passthrough mode. Same routes as ``app``
+# (registered below by ``_register_routes``), but no tunnel-client
+# lifespan — running the same FastAPI instance under hypercorn would
+# re-fire the outer lifespan and double-start the tunnel client.
+loopback_app = FastAPI(
+    title="Inkbox sample client/server (loopback)",
+    version="0.1.0",
+)
+
+
+@loopback_app.get("/__loopback_health")
+async def _loopback_health() -> PlainTextResponse:
+    """Loopback hypercorn liveness probe.
+
+    MUST NOT be gated by signature/auth dependencies — the bootstrap
+    health check sends an unsigned request, and any future global auth
+    middleware would otherwise return non-2xx and trigger a misleading
+    "loopback unhealthy" startup error.
+    """
+    return PlainTextResponse("OK")
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +359,9 @@ def build_webhook_http_response(payload: ParsedWebhook) -> IncomingCallActionRes
     """
     if not isinstance(payload, PhoneIncomingCallWebhookPayload):
         return None
-    # client_websocket_url is stored on the phone number itself (patched at
-    # boot by ngrok_bootstrap), so we don't need to override it here.
+    # client_websocket_url is stored on the phone number itself (patched
+    # at boot by inkbox_tunnel_bootstrap), so we don't need to override
+    # it here.
     return IncomingCallActionResponse(action="answer")
 
 
@@ -226,13 +404,19 @@ def _persist_payload(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/health")
+# Routes are registered on a router and then mounted on both ``app`` and
+# ``loopback_app`` so the loopback hypercorn (passthrough mode) serves
+# the same surface the third party would otherwise hit at the edge.
+router = APIRouter()
+
+
+@router.get("/health")
 async def health() -> PlainTextResponse:
     """Liveness endpoint. Always returns 200 OK."""
     return PlainTextResponse("OK")
 
 
-@app.post("/webhook", response_model=None)
+@router.post("/webhook", response_model=None)
 async def webhook(request: Request) -> JSONResponse | PlainTextResponse:
     """
     Inkbox webhook receiver.
@@ -317,7 +501,7 @@ def _verify_ws_handshake_signature(headers: dict[str, str]) -> bool:
     )
 
 
-@app.websocket("/phone/media/ws")
+@router.websocket("/phone/media/ws")
 async def phone_media_ws(websocket: WebSocket) -> None:
     """
     Live phone-media WebSocket handler.
@@ -334,16 +518,38 @@ async def phone_media_ws(websocket: WebSocket) -> None:
         return
 
     call = _parse_call_context(headers)
+    use_realtime = EnvConfig.USE_OPENAI_REALTIME
+    accept_headers = (
+        REALTIME_HANDSHAKE_RESPONSE_HEADERS if use_realtime else HANDSHAKE_RESPONSE_HEADERS
+    )
     await websocket.accept(
         headers=[
             (k.lower().encode(), v.encode())
-            for k, v in HANDSHAKE_RESPONSE_HEADERS.items()
+            for k, v in accept_headers.items()
         ],
     )
     logger.info(
-        "Call WS connected call_id=%s local=%s direction=%s",
+        "Call WS connected call_id=%s local=%s direction=%s mode=%s",
         call.call_id, call.phone_number, call.direction,
+        "openai-realtime" if use_realtime else "inkbox-tts-stt",
     )
+
+    if use_realtime:
+        try:
+            await run_realtime_bridge(
+                websocket=websocket,
+                api_key=EnvConfig.OPENAI_API_KEY,
+                model=EnvConfig.OPENAI_REALTIME_MODEL,
+                call_id=call.call_id,
+            )
+        except WebSocketDisconnect:
+            pass
+        finally:
+            logger.info("Call WS closed call_id=%s", call.call_id)
+            if websocket.client_state != WebSocketState.DISCONNECTED:
+                with suppress(RuntimeError):
+                    await websocket.close()
+        return
 
     agent = PhoneAgent(api_key=EnvConfig.OPENAI_API_KEY)
 
@@ -409,6 +615,10 @@ async def phone_media_ws(websocket: WebSocket) -> None:
                 pass
 
 
+app.include_router(router)
+loopback_app.include_router(router)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -434,9 +644,54 @@ def main() -> None:
         EnvConfig.INKBOX_REQUIRE_SIGNATURE,
     )
     logger.info("Payloads directory: %s", PAYLOADS_DIR)
-    setup_ngrok_and_patch_inkbox()
+
+    # 1. Ensure the Inkbox tunnel exists (mode-aware). For passthrough
+    #    this also generates the keypair, gets a signed cert via
+    #    /sign-csr, and persists everything to the state dir.
+    bundle = bootstrap_tunnel()
+
+    # 2. Patch all phone numbers + mailboxes to the public host.
+    patch_inkbox_objects_to_tunnel(bundle.public_host)
+
+    # 3. For passthrough mode, pre-bind the loopback listening socket
+    #    here (synchronously) so the port is known before the tunnel
+    #    client constructor and the kernel queues SYNs the moment we
+    #    publish it. listen() is required — bind() alone gives
+    #    ECONNREFUSED on dial.
+    loopback_port: int | None = None
+    loopback_sock: socket.socket | None = None
+    if bundle.tls_mode is TunnelTLSMode.PASSTHROUGH:
+        loopback_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        loopback_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        loopback_sock.bind(("127.0.0.1", EnvConfig.INKBOX_TUNNEL_LOOPBACK_PORT))
+        loopback_sock.listen(128)
+        loopback_sock.setblocking(False)
+        loopback_port = loopback_sock.getsockname()[1]
+        logger.info(
+            "[passthrough] loopback listening socket bound to 127.0.0.1:%d",
+            loopback_port,
+        )
+
+    app.state.loopback_sock = loopback_sock
+    app.state.loopback_app = loopback_app if loopback_sock is not None else None
+
+    # 4. Build + register the tunnel client. Started in the lifespan hook.
+    app.state.tunnel_client = InkboxTunnelClient(
+        tunnel_id=bundle.tunnel_id,
+        secret=bundle.secret,
+        zone=EnvConfig.INKBOX_TUNNEL_ZONE,
+        pool_size=EnvConfig.INKBOX_TUNNEL_POOL_SIZE,
+        local_app=app,
+        tls_terminator=bundle.tls_terminator,
+        loopback_port=loopback_port,
+    )
+
+    # Pass the FastAPI instance directly. Using the import string
+    # ("server:app") would have uvicorn re-import the module fresh,
+    # producing a *different* `app` whose `.state.tunnel_client` is
+    # unset — and the lifespan would silently no-op the tunnel client.
     uvicorn.run(
-        "server:app",
+        app,
         host="0.0.0.0",
         port=EnvConfig.LISTEN_PORT,
         log_level="info",

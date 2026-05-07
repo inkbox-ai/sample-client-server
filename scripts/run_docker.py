@@ -80,6 +80,9 @@ def main() -> None:
     payloads_dir = REPO_ROOT / "payloads"
     payloads_dir.mkdir(exist_ok=True)
 
+    tunnel_state_dir = REPO_ROOT / ".inkbox-tunnel-state"
+    tunnel_state_dir.mkdir(exist_ok=True)
+
     print(f">> running {args.image_name} on :{args.host_port} (ctrl-c to stop)...")
     os.execvp(
         "docker",
@@ -93,6 +96,8 @@ def main() -> None:
             str(REPO_ROOT / ".env"),
             "-v",
             f"{payloads_dir}:/app/payloads",
+            "-v",
+            f"{tunnel_state_dir}:/app/.inkbox-tunnel-state",
             args.image_name,
         ],
     )

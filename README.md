@@ -36,9 +36,11 @@ On the identity's detail page, open **API keys** → **Create key**. Copy the ke
 
 Go to [console.inkbox.ai/webhooks](https://inkbox.ai/console/webhooks) → **Create signing key**. Copy the `whsec_...` value. This is your `INKBOX_SIGNING_KEY` — used by this server to verify `X-Inkbox-Signature` on every inbound webhook and on the phone-media WebSocket handshake.
 
-### 4. Grab an ngrok authtoken
+### 4. Pick an Inkbox tunnel name
 
-Create a free account at [dashboard.ngrok.com](https://dashboard.ngrok.com), then open [dashboard.ngrok.com/get-started/your-authtoken](https://dashboard.ngrok.com/get-started/your-authtoken) and copy the token. This is your `NGROK_AUTHTOKEN` — the bootstrap uses it to open a public HTTPS tunnel to this local server so Inkbox can reach your webhooks.
+Choose a subdomain label (lowercase, hyphens OK; e.g. `demo-acme`). On startup the bootstrap creates a tunnel under `{name}.development.inkboxwire.com` via the Inkbox tunnels API and persists the per-tunnel `connect_secret` (shown once) under `.inkbox-tunnel-state/`. This replaces the old ngrok flow — the tunnel is first-party and routes through a single persistent HTTP/2 connection from this process.
+
+The default `INKBOX_TUNNEL_TLS_MODE=edge` lets Inkbox terminate TLS for you. Switch to `passthrough` if you want to hold the private key locally — the bootstrap will generate a keypair, submit a CSR via `POST /tunnels/{id}/sign-csr`, and persist the LE-signed cert chain alongside the key.
 
 ### 5. Grab an OpenAI API key
 
@@ -54,13 +56,13 @@ chmod 600 .env
 Open `.env` and paste in the four values you just collected:
 
 ```
-INKBOX_API_KEY=...        # step 2
+INKBOX_API_KEY=...            # step 2
 INKBOX_SIGNING_KEY=whsec_...  # step 3
-NGROK_AUTHTOKEN=...       # step 4
-OPENAI_API_KEY=sk-...     # step 5
+INKBOX_TUNNEL_NAME=demo-acme  # step 4
+OPENAI_API_KEY=sk-...         # step 5
 ```
 
-That's it — you're ready to run. On startup the server will open the ngrok tunnel, PATCH every phone number + mailbox on your identity to point at the tunnel, and start serving webhooks + the phone-media WebSocket.
+That's it — you're ready to run. On startup the server will create the Inkbox tunnel (first run) or reuse it (subsequent runs), PATCH every phone number + mailbox on your identity to point at `{INKBOX_TUNNEL_NAME}.development.inkboxwire.com`, open the persistent HTTP/2 data-plane connection, and start serving webhooks + the phone-media WebSocket. The per-tunnel `connect_secret` is written once under `.inkbox-tunnel-state/` (chmod 600); for `passthrough` mode the private key + LE-signed cert chain live there too.
 
 ## Configuration notes
 
