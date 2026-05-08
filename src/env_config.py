@@ -8,7 +8,7 @@ import os
 
 from dotenv import load_dotenv
 
-from data_models.tunnel import TunnelTLSMode
+from inkbox.tunnels import TLSMode
 
 load_dotenv()
 
@@ -72,8 +72,8 @@ class EnvConfig():
     # `edge` (default) | `passthrough`. Fixed at tunnel creation; switching
     # modes requires deleting the existing tunnel and creating a new one
     # under a different name (the old name is locked for 60 days).
-    INKBOX_TUNNEL_TLS_MODE: TunnelTLSMode = TunnelTLSMode(
-        os.getenv("INKBOX_TUNNEL_TLS_MODE", TunnelTLSMode.EDGE.value).strip().lower(),
+    INKBOX_TUNNEL_TLS_MODE: TLSMode = TLSMode(
+        os.getenv("INKBOX_TUNNEL_TLS_MODE", TLSMode.EDGE.value).strip().lower(),
     )
 
     # Per-tunnel data-plane secret. Returned ONCE from POST /api/v1/tunnels

@@ -6,20 +6,16 @@ version = "0.1.0"
 description = "Sample Inkbox webhook receiver + phone media WebSocket server (single FastAPI process)"
 requires-python = ">=3.12"
 dependencies = [
-  "aiohttp>=3.13.4", # async HTTP client/server
-  "cryptography>=42.0.0", # passthrough mode: keygen + CSR + TLS termination
   "fastapi>=0.115.12",
-  "h2>=4.1.0", # raw HTTP/2 frame control for parked intake streams
-  "httpx[http2]>=0.28.1",
-  "hypercorn>=0.17.3", # passthrough mode loopback ASGI server (h2 + h2c + WS)
-  "inkbox==0.2.10",
+  # SDK provides the tunnel runtime (bootstrap, h2 control, passthrough
+  # TLS termination, h2-transcode forwarding) and the org-level resources
+  # (mailboxes, phone numbers, etc.) we used to call directly via httpx.
+  "inkbox==0.3.1",
   "openai>=1.99.0",
   "pydantic>=2.11.4",
   "python-dotenv>=1.1.0",
   "python-multipart>=0.0.20",
   "uvicorn[standard]>=0.34.3",
-  "websocket-client>=1.6.0",
-  "websockets>=15.0.1",
 ]
 
 [project.scripts]
@@ -32,3 +28,4 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include = ["src"]
 sources = { "src" = "" }
+
